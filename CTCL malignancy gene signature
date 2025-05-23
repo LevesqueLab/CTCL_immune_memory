@@ -1,0 +1,153 @@
+# CTCL malignancy gene signature building and scoring on T-cells CTCL blood and T-cells CTCL skin
+
+```{r, include = FALSE}
+library(Seurat)
+library(UCell)
+library(pROC)
+library(ggplot2)
+library(dplyr)
+library(readxl)
+library(writexl)
+library(ggVennDiagram)
+library(viridis)
+```
+
+```{r}
+seu_skin <- readRDS("/SKIN_Tcells.rds") #load CTCL skin T-cell object with final typing
+
+meta <- seu_skin@meta.data
+meta$Tcells[meta$Tcells %in% c("Malignant TCM", "Malignant IS")] <- "Malignant TCM" # merge both malignant clusters into 1 
+
+seu_skin@meta.data <- meta #replace metadata
+seu_skin <- SetIdent(seu_skin, value = seu_skin@meta.data$Tcells)
+```
+
+```{r}
+seu_blood <- readRDS("/BLOOD_Tcells.rds") #load CTCL blood T-cell object with final typing
+```
+
+
+# Published Malignant Genesets 
+```{r, echo = FALSE}
+Rindler <- read.csv("/rstudio-data/Andrea/Rstudio_server/home/Projects/scCTCL/external_data/Rindler_sc/rindler_DEGs.csv")
+Rindler <- Rindler %>%
+  filter(p_val_adj < 0.001 & avg_log2FC > 0)
+Rindler <- Rindler$X
+
+Jonak <- read_excel("//rstudio-data/Andrea/Rstudio_server/home/Projects/scCTCL/external_data/Jonak_sc/Jonak_Signature.xlsx")
+Jonak <- Jonak %>%
+  filter(P_val_adj < 0.001 & avg_logFC > 0)
+Jonak <- Jonak$Gene
+
+Li <- read_excel("/Suppl_Tables.xlsx", sheet = "Supplementary Table 2") #published Suppl. Table 2 Li et al. 2024
+colnames(Li) <- Li[1,]
+Li <- Li[-1,]
+Li$padj <- as.numeric(as.character(Li$padj))
+Li$log2FoldChange <- as.numeric(as.character(Li$log2FoldChange)) 
+Li <- Li %>%
+  filter(padj < 0.001 & log2FoldChange > 1) 
+Li <- Li$Gene
+
+Borcherding <- read_excel("/Borcherding_Suppl_Table2.xlsx") #published Suppl. Table 2 Borchdering et al. 2019
+Borcherding <- Borcherding %>%
+  filter(p_val_adj < 0.001 & avg_logFC > 1)
+Borcherding <- Borcherding$genes
+```
+
+# Overlap signatures with the four large datasets
+```{r}
+mal.list <- list('Jonak (s)' = Jonak, 'Rindler (s)' = Rindler, 'Borcherding (b)' = Borcherding, 'Li (s)' = Li)
+
+# Create a table of item occurrences across all vectors
+item_counts <- table(unlist(mal.list))
+
+# Filter items that are shared in 2/3 or 4 genesets
+in_2_JRBL <- names(item_counts[item_counts >= 2])
+in_3_JRBL <- names(item_counts[item_counts >= 3])
+in_4_JRBL <- names(item_counts[item_counts >= 4])
+```
+
+```{r}
+# generate named list of signatures
+comb.list <- list('2 genesets' = in_2_JRBL, '3 genesets' = in_3_JRBL, '4 genesets' = in_4_JRBL)
+```
+
+```{r}
+# generate named list of samples
+sample_list <- list('skin' = seu_skin, 'blood' = seu_blood)
+```
+
+```{r, echo=FALSE, results="asis", fig.width=9, fig.height=4}
+for  (sample_name in names(sample_list)){
+  sam <- sample_list[[sample_name]]  # Get the Seurat object
+  seu_score <- AddModuleScore_UCell(sam,  features = comb.list, assay = "RNA", ncores = 20)
+
+positive_class <- "Malignant TCM"  # Replace with the target cell type name
+metadata <- seu_score@meta.data
+
+metadata$Target <- ifelse(metadata$Tcells == positive_class, 1, 0)
+
+# Extract signature scores
+signature_columns <- grep("_UCell$", colnames(metadata), value = TRUE)  
+
+# Compute ROC curves for each signature
+roc_list <- lapply(signature_columns, function(signature) {
+  roc(metadata$Target, metadata[[signature]], quiet = TRUE)
+})
+
+# Prepare data for ggplot
+roc_df <- do.call(rbind, lapply(1:length(roc_list), function(i) {
+  data.frame(
+    Sensitivity = roc_list[[i]]$sensitivities,
+    Specificity = 1 - roc_list[[i]]$specificities,
+    Signature = signature_columns[i]
+  )
+}))
+
+# Rename each Signature individually
+roc_df <- roc_df %>%
+  mutate(Signature = recode(Signature,
+                            "2 genesets_UCell" = "shared 2 genesets",
+                            "3 genesets_UCell" = "shared 3 genesets",
+                            "4 genesets_UCell" = "shared 4 genesets"))
+
+# Define custom colors for each Signature
+signature_colors <- c(
+  "shared 2 genesets" = "#FF033E",
+  "shared 3 genesets" = "coral",
+  "shared 4 genesets" = "#DCAE96"
+)
+
+# Plot the ROC curves
+a <- ggplot(roc_df, aes(x = Specificity, y = Sensitivity, color = Signature)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = signature_colors) +  # Apply custom colors
+  theme_minimal() +
+  labs(
+    title = paste(sample_name), 
+    x = "1 - Specificity",
+    y = "Sensitivity",
+    color = "Signature"
+  ) +
+  theme(legend.position = "right")
+b <- FeaturePlot(seu_score, features = "2 genesets_UCell", ncol = 1, pt.size = 0.8, order = T, reduction = "umap",  max.cutoff = 'q99') + scale_color_viridis(option = "plasma") 
+
+print(a|b)
+}
+```
+
+# Venn diagram of signature overlaps
+```{r}
+# generate named list of signatures
+mal.list <- list('Jonak 2021' = Jonak, 'Rindler 2021' = Rindler, 'Borcherding 2023' = Borcherding, 'Li 2024' = Li)
+
+ggVennDiagram(mal.list, label = "count", set_size = 6, label_size = 7) +
+  scale_x_continuous(expand = expansion(mult = .2)) +
+  scale_fill_gradientn(
+    colors = c("darkred", "red", "pink", "white"),  # Color transition
+    values = c(0, 0.3, 0.6, 1),  # Adjust transition points (0 = min, 1 = max)
+    limits = c(0, 450)  # Ensure scaling up to 150
+  )
+```
+
+
