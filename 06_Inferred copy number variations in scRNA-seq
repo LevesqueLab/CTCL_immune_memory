@@ -1,0 +1,329 @@
+# Inferred copy number variations in scRNA-seq
+
+```{r}
+library(Seurat)
+library(infercnv)
+library(SCpubr)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(paletteer)
+library(RColorBrewer)
+library(ComplexHeatmap)
+library(circlize)
+library(dittoSeq)
+library(qs)
+```
+
+# blood
+```{r }
+seu_T <- readRDS("/BLOOD_Tcells.rds") #import typed CTCL blood object
+seu_T <- SetIdent(seu_T, value = seu_T@meta.data$Tcells)
+```
+## CountMatrix
+```{r}
+Count_Matrix <- as.matrix(GetAssayData(seu_T, assay = "RNA", slot = "counts"))
+
+write.table(as.matrix(Count_Matrix), 
+            /raw_count_matrix_CTCL_T_blood.txt",
+            col.names = TRUE, row.names = TRUE, sep = "\t")
+```
+
+## Annotation file
+```{r}
+metadata_seu <- seu_T@meta.data
+
+#select T-cells to be inferred from CTCL sample
+metadata_seu_anno <- metadata_seu 
+metadata_seu_anno$Barcode <- rownames(metadata_seu)
+metadata_seu_anno <- subset(metadata_seu_anno, select = c("Barcode","Tcells")) 
+
+rownames(metadata_seu_anno) <- metadata_seu_anno[,1]
+metadata_seu_anno <- subset(metadata_seu_anno, select = c("Tcells")) %>% as.matrix()
+
+write.table(metadata_seu_anno,
+            "Blood_Tcells_anno.txt",
+            row.names = TRUE, col.names = FALSE, sep = "\t")
+```
+
+## Run InferCNV
+```{r}
+options(scipen = 100)
+
+infercnv_obj <- CreateInfercnvObject(
+  raw_counts_matrix = "/raw_count_matrix_CTCL_T_blood.txt",
+  annotations_file ="Blood_Tcells_anno.txt",
+  gene_order_file = "/hg38_gencode_v27.txt", #hg38 human gene code
+  ref_group_names = "NK")
+  
+# Perform infercnv operations to reveal cnv signal
+infercnv_obj <- infercnv::run(infercnv_obj,
+                              cutoff = 0.1,
+                              out_dir = "/InferCNV_blood_T_NKref", # dir is auto-created for storing outputs
+                              HMM = TRUE,
+                              num_threads = 50, 
+                              cluster_by_groups = TRUE,
+                              denoise = TRUE,
+                              sd_amplifier = 3, 
+                              noise_logistic = TRUE, 
+                              png_res = 300,
+                              BayesMaxPNormal = 0.2, # default is 0.5
+                              tumor_subcluster_partition_method = "leiden",
+                              num_ref_groups = 2, 
+                              z_score_filter = 0.5 # default = 0.8
+)
+```
+## Heatmap
+```{r}
+hmm_obj =  dir("/InferCNV_blood_T_NKref/", pattern = "20_HMM_pred\\..*\\.infercnv_obj")
+hmm_obj = readRDS(paste0("/InferCNV_blood_T_NKref/", hmm_obj))
+```
+```{r}
+# sample cells for each patient
+sample_tcells <- function(data) {
+  # Count the number of cells for each type
+  malignant <- data %>%
+    filter(Tcells == "Malignant TCM") %>%
+    slice_sample(n = ifelse(nrow(.) >= 200, 200, nrow(.)))
+  
+  remaining <- data %>%
+    filter(Tcells != "Malignant TCM") %>%
+    slice_sample(n = ifelse(nrow(.) >= 100, 100, nrow(.)))
+  
+  # Combine the two subsets
+  bind_rows(malignant, remaining)
+}
+```
+
+```{r, fig.height = 6, fig.width=6}
+clusters <-  seu_T@meta.data 
+clusters$barcode <- rownames(clusters)
+  
+  clusters <- clusters %>% select(barcode, Tcells, patient) %>% filter(patient %in% c("blood 1", "blood 2", "blood 3", "blood 4", "blood 5", "blood 6", "blood 7", "blood 8"))%>%
+    group_by(patient) %>%
+    group_split() %>%
+    lapply(sample_tcells) %>%
+    bind_rows() %>%
+    arrange(Tcells, patient) 
+  
+  hmm_expr = hmm_obj@expr.data[, clusters$barcode]
+  final_expr = hmm_expr 
+    df = t(final_expr[, clusters$barcode])
+
+  mode_df = as.data.table(table(df[, 1])) %>% mutate(number = as.double(V1))
+  middle = filter(mode_df, N == max(N)) %>% pull(number)
+  range_df = range(df)
+
+# Manually set the color
+col_as <- as.character() 
+col_as[["Malignant TCM"]] <- "#000080"  
+col_as[["CD4 naive T"]] <- "#1CBE4FFF"
+col_as[["CD4 TCM"]] <- "#90AD1CFF"
+col_as[["CD4 TEM"]] <- "#1C8356FF"
+col_as[["Treg"]] <- "#006600FF"
+col_as[["CTL"]] <- "#664466FF"
+col_as[["CD8 naive T"]] <- "#CC99CCFF"
+col_as[["CD8 TEM"]] <- "#FF9966FF"
+col_as[["gdT"]] <- "#BB6622FF"
+col_as[["Prolif T"]] <- "#FFCC99FF"
+col_as[["NK TOX+"]] <- "#CC6666FF"
+col_as[["NK"]] <- "#882211FF"
+
+pat_cols = setNames(brewer.pal(uniqueN(clusters$patient), "Spectral"), unique(clusters$patient))
+  
+hma = rowAnnotation(`Celltype` = clusters$Tcells,
+                    `Patient` = clusters$patient, 
+                    col = list(`Celltype` = col_as,
+                               `Patient` = pat_cols))
+
+  #chr = HeatmapAnnotation(`chr` = runif(22) )
+
+  rownames(df) <- NULL
+  colnames(df) <- NULL
+  
+  if(!range_df[1] == 1){
+    expression = circlize::colorRamp2(breaks = c(range_df[1], middle, range_df[2]), 
+                                      colors = c("#00428c", "white", "#9e002a"))
+  }else{
+    expression = circlize::colorRamp2(breaks = c(range_df[1], range_df[2]), 
+                                      colors = c("white", "#9e002a"))
+  }
+
+# Extract gene order for chromosome information
+gene_order <- hmm_obj@gene_order
+
+# Calculate chromosome boundaries
+chromosome_boundaries <- cumsum(table(gene_order$chr))
+
+# Create chromosome labels
+chromosome_labels <- rep("", ncol(df))
+chromosome_labels[chromosome_boundaries] <- unique(gene_order$chr)
+
+# Add chromosome labels as x-axis annotation
+col_annotation <- HeatmapAnnotation(
+  Chromosome = anno_text(
+    chromosome_labels, 
+    rot = 90, 
+    just = "right", 
+    gp = gpar(fontsize = 10)
+  ),
+  annotation_height = unit(1.5, "cm")  # Increase annotation height
+)
+
+# Plot the heatmap with annotations
+Heatmap(
+  df,
+  border_gp = gpar(col = "#a6a6a6"),
+  right_annotation = hma,
+  bottom_annotation = col_annotation,
+  use_raster = TRUE,
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  col = expression,
+  column_labels = NULL  
+)
+```
+
+# skin 
+```{r }
+seu_T <- readRDS("/SKIN_Tcells.rds") #import typed CTCL skin object
+seu_T <- SetIdent(seu_T, value = seu_T@meta.data$Tcells)
+```
+## CountMatrix
+```{r}
+Count_Matrix <- as.matrix(GetAssayData(seu_T, assay = "RNA", slot = "counts"))
+
+write.table(as.matrix(Count_Matrix), 
+            /raw_count_matrix_CTCL_T_skin.txt",
+            col.names = TRUE, row.names = TRUE, sep = "\t")
+```
+
+## Annotation file
+```{r}
+metadata_seu <- seu_T@meta.data
+
+#select T-cells to be inferred from CTCL sample
+metadata_seu_anno <- metadata_seu 
+metadata_seu_anno$Barcode <- rownames(metadata_seu)
+metadata_seu_anno <- subset(metadata_seu_anno, select = c("Barcode","Tcells")) 
+
+rownames(metadata_seu_anno) <- metadata_seu_anno[,1]
+metadata_seu_anno <- subset(metadata_seu_anno, select = c("Tcells")) %>% as.matrix()
+
+write.table(metadata_seu_anno,
+            "Skin_Tcells_anno.txt",
+            row.names = TRUE, col.names = FALSE, sep = "\t")
+```
+
+## Run InferCNV
+```{r}
+options(scipen = 100)
+
+infercnv_obj <- CreateInfercnvObject(
+  raw_counts_matrix = "/raw_count_matrix_CTCL_T_skin.txt",
+  annotations_file ="Skin_Tcells_anno.txt",
+  gene_order_file = "/hg38_gencode_v27.txt", #hg38 human gene code
+  ref_group_names = "NK")
+  
+# Perform infercnv operations to reveal cnv signal
+infercnv_obj <- infercnv::run(infercnv_obj,
+                              cutoff = 0.1,
+                              out_dir = "/InferCNV_skin_T_NKref", # dir is auto-created for storing outputs
+                              HMM = TRUE,
+                              num_threads = 50, 
+                              cluster_by_groups = TRUE,
+                              denoise = TRUE,
+                              sd_amplifier = 3, 
+                              noise_logistic = TRUE, 
+                              png_res = 300,
+                              BayesMaxPNormal = 0.2, # default is 0.5
+                              tumor_subcluster_partition_method = "leiden",
+                              num_ref_groups = 2, 
+                              z_score_filter = 0.5
+)
+```
+## Heatmap
+```{r}
+hmm_obj =  dir("/InferCNV_skin_T_NKref/", pattern = "20_HMM_pred\\..*\\.infercnv_obj")
+hmm_obj = readRDS(paste0("/InferCNV_skin_T_NKref/", hmm_obj))
+```
+
+```{r, fig.height = 6, fig.width=6}
+clusters <-  seu_T@meta.data 
+clusters$barcode <- rownames(clusters)
+  
+clusters <-  seu_T@meta.data %>% select(barcode, Tcells, patient) %>% 
+    arrange(Tcells, patient)
+  
+  hmm_expr = hmm_obj@expr.data[, clusters$barcode]
+  final_expr = hmm_expr 
+    df = t(final_expr[, clusters$barcode])
+
+  mode_df = as.data.table(table(df[, 1])) %>% mutate(number = as.double(V1))
+  middle = filter(mode_df, N == max(N)) %>% pull(number)
+  range_df = range(df)
+
+# Manually set the color
+celltype_cols <- as.character() 
+celltype_cols[["Malignant TCM"]] <- "#000080"  
+celltype_cols[["Malignant IS"]] <- "#0011EEFF" 
+celltype_cols[["CD4 TRM"]] <- "#66CC33FF" 
+celltype_cols[["CD4 TRMr"]] <- "#BBAA55FF"
+celltype_cols[["Treg"]] <- "#006600FF"
+celltype_cols[["CD8 T"]] <- "#DD6644FF"
+celltype_cols[["NK"]] <- "#882211FF"
+
+pat_cols = setNames(brewer.pal(uniqueN(clusters$patient), "Spectral"), unique(clusters$patient))
+
+hma = rowAnnotation(`Celltype` = clusters$Tcells,
+                    `Patient` = clusters$patient, 
+                    col = list(`Celltype` = celltype_cols,
+                               `Patient` = pat_cols))
+
+rownames(df) <- NULL
+colnames(df) <- NULL
+
+
+if(!range_df[1] == 1){
+  expression = circlize::colorRamp2(breaks = c(range_df[1], middle, range_df[2]), 
+                                    colors = c("#00428c", "white", "#9e002a"))
+}else{
+  expression = circlize::colorRamp2(breaks = c(range_df[1], range_df[2]), 
+                                    colors = c("white", "#9e002a"))
+}
+
+# Extract gene order for chromosome information
+gene_order <- hmm_obj@gene_order
+
+# Calculate chromosome boundaries
+chromosome_boundaries <- cumsum(table(gene_order$chr))
+
+# Create chromosome labels
+chromosome_labels <- rep("", ncol(df))
+chromosome_labels[chromosome_boundaries] <- unique(gene_order$chr)
+
+# Add chromosome labels as x-axis annotation
+col_annotation <- HeatmapAnnotation(
+  Chromosome = anno_text(
+    chromosome_labels, 
+    rot = 90, 
+    just = "right", 
+    gp = gpar(fontsize = 8)
+  ),
+  annotation_height = unit(1.5, "cm")  # Increase annotation height
+)
+
+# Plot the heatmap with annotations
+Heatmap(
+  df,
+  border_gp = gpar(col = "#a6a6a6"),
+  right_annotation = hma,
+  bottom_annotation = col_annotation,
+  use_raster = TRUE,
+  cluster_columns = FALSE,
+  cluster_rows = FALSE,
+  col = expression,
+  column_labels = NULL  # Avoid redundant row labels
+)
+```
+
