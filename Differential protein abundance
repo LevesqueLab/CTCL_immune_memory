@@ -1,0 +1,59 @@
+```{r}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+library(DT)
+library(htmltools)
+library(future)     # for multicore setup
+```
+# Differential protein abundance Malignant T vs CD4 T in CTCL blood
+```{r }
+seu_T <- readRDS("/BLOOD_Tcells.rds") #read CTCL blood Tcells with final typing
+seu_sub <- subset(seu_T, subset = Tcells %in% c("Malignant TCM", "CD4 naive T", "CD4 TCM", "CD4 TEM"))
+```
+
+```{r, Set Idents seu_CTCL}
+meta <- seu_sub@meta.data
+meta$Tcells[meta$Tcells %in% c("CD4 naive T", "CD4 TCM", "CD4 TEM")] <- "CD4 T"
+seu_sub <- AddMetaData(seu_sub,meta)
+``` 
+
+## Proteinlist
+```{r, paged.print=FALSE, results='asis'}
+DefaultAssay(seu_sub) <- "ADT"
+seu_sub <- SetIdent(seu_sub, value = seu_sub@meta.data$Tcells)
+bulk.TCMMal.de <- FindAllMarkers(object = seu_sub, 
+                         test.use = "LR", latent.vars = "patient",  return.thresh = 0.05) 
+
+bulk.TCMMal.de$Protein <- rownames(bulk.TCMMal.de)
+top <- bulk.TCMMal.de %>%
+        filter(p_val_adj < 0.01)
+
+top8 <- bulk.TCMMal.de %>%
+        top_n(8, avg_log2FC) %>% pull (gene)
+
+DotPlot(seu_sub, group.by = "Tcells", features = top8) + theme(axis.text.x = element_text(angle = 90)) +scale_colour_gradient2(low="lightgreen", mid="lightgrey", high="coral")
+```
+
+# Differential protein abundance within Malignant subpopulations 
+```{r}
+seu_Mal <- qread(("/CTCLblood_Malignant_T.qs")) #import CTCL blood Malignant T-cells object with finalized typing 
+DefaultAssay(seu_Mal) <- "ADT"
+seu_Mal <- SetIdent(seu_Mal, value = seu_Mal@meta.data$Malignant_T)
+```
+```{r, paged.print=FALSE, results='asis'}
+bulk.TCMMal.de <- FindAllMarkers(object = seu_Mal, 
+                         test.use = "LR", latent.vars = "patient",  return.thresh = 0.05) 
+
+bulk.TCMMal.de$Protein <- rownames(bulk.TCMMal.de)
+
+top5 <- bulk.TCMMal.de %>%
+  filter(cluster == "mTCM") %>%
+        group_by(cluster) %>%
+        top_n(5, avg_log2FC)
+protein_list <- unique(top5$Protein)
+protein_list <- gsub("\\.1$", "", protein_list)
+
+DotPlot(seu_Mal, group.by = "Malignant_T", features = protein_list) + theme(axis.text.x = element_text(angle = 90)) +scale_colour_gradient2(low="lightgreen", mid="lightgrey", high="coral")
+```
+
