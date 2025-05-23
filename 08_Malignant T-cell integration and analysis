@@ -1,0 +1,105 @@
+Malignant T-cell integration
+
+```{r, include = FALSE}
+library(Seurat)
+library(dplyr)
+library(bbknnR)
+library(SCpubr)
+library(future)
+library(RColorBrewer)
+library(DT)
+library(htmltools)
+```
+
+```{r }
+blood_T <- readRDS("/BLOOD_Tcells.rds") #read the typed blood T-cells 
+blood_T <- SetIdent(blood_T, value = blood_T@meta.data$TCM)
+DefaultAssay(blood_T) <- "RNA"
+
+
+skin_T <- readRDS("/rstudio-data/Andrea/Rstudio_server/home/Projects/scCTCL/CTCL_Skin/Data/MF_SS_Malignant_T.rds")
+skin_T <- SetIdent(skin_T, value = skin_T@meta.data$TCM)
+DefaultAssay(skin_T) <- "RNA"
+```
+
+```{r}
+#align metadata
+meta_s <- skin_T@meta.data
+meta_b <- blood_T@meta.data
+
+#modulate condition to indicate MF or SS
+meta_b$condition <- meta_b$status %>% as.character()
+meta_b <- meta_b %>%
+  mutate(condition = ifelse(condition == "CTCL", "SS", condition))
+
+# Subset both dataframes to keep only the common columns
+only_in_skin <- setdiff(names(meta_s), names(meta_b))
+only_in_blood <- setdiff(names(meta_b), names(meta_s))
+common_columns <- intersect(names(meta_b), names(meta_s))
+meta_b_common <- meta_b[, common_columns]
+meta_s_common <- meta_s[, common_columns]
+
+# setup tissue metadata
+meta_b_common$tissue <- "blood"
+meta_s_common$tissue <- "skin"
+
+#add modified metadata to object
+blood_T <- AddMetaData(blood_T,meta_b_common)
+skin_T <- AddMetaData(skin_T,meta_s_common)
+
+# Normalize both datasets using SCTransform 
+skin_T <- SCTransform(skin_T, verbose = FALSE)
+blood_T <- SCTransform(blood_T, verbose = FALSE)
+
+# merge
+blood.skin.merged <- merge(skin_T, blood_T)
+```
+
+## Reclustering without integration {.tabset}
+Samples are split by tissue type
+```{r , results='hide'}
+DefaultAssay(blood.skin.merged) <- "RNA"
+blood.skin.merged[["RNA"]] <- JoinLayers(blood.skin.merged[["RNA"]])
+blood.skin.merged[["RNA"]] <- split(blood.skin.merged[["RNA"]], f = blood.skin.merged$tissue)
+blood.skin.merged <- SCTransform(blood.skin.merged)
+blood.skin.merged <- RunPCA(blood.skin.merged)
+blood.skin.merged <- FindNeighbors(blood.skin.merged, dims = 1:30, reduction = "pca")
+blood.skin.merged <- FindClusters(blood.skin.merged, resolution = 1, cluster.name = "unintegrated_clusters")
+blood.skin.merged <- RunUMAP(blood.skin.merged, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
+DimPlot(blood.skin.merged, reduction = "umap.unintegrated", group.by = c("tissue", "patient"))
+```
+
+## CCA Integration 
+```{r, results='hide'}
+blood.skin.merged <- IntegrateLayers(object = blood.skin.merged, method = CCAIntegration, verbose = FALSE, normalization.method = "SCT")
+blood.skin.merged[["RNA"]] <- JoinLayers(blood.skin.merged[["RNA"]])
+
+blood.skin.merged <- FindNeighbors(blood.skin.merged, reduction = "integrated.dr", dims = 1:30)
+blood.skin.merged <- FindClusters(blood.skin.merged, resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1))
+blood.skin.merged <- RunUMAP(blood.skin.merged, dims = 1:30, reduction = "integrated.dr")
+```
+
+```{r, fig.width=14}
+blood.skin.merged <- RunUMAP(blood.skin.merged, dims = 1:30, reduction = "pca", reduction.name = "umap")
+DimPlot(blood.skin.merged, reduction = "integrated.dr", group.by = c("tissue","patient"))
+```
+
+# BBKNN-integration {.tabset .tabset-pills}
+```{r, include = FALSE}
+blood.skin.merged$patient <- paste(blood.skin.merged$tissue, blood.skin.merged$patient, sep ="_")
+bs_min <- subset(blood.skin.merged, subset = patient %in% c("CTCL_10"), invert = TRUE) #as no malignant T-cells detected
+
+Mal_bbknn <- RunBBKNN(bs_min, batch_key = "patient") 
+Mal_bbknn <- FindClusters(Mal_bbknn, graph.name = "bbknn", resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1))
+```
+
+```{r, results='asis', fig.width=5, fig.height=5}
+cat("\n\n\n\n## ", "UMAP", " {.tabset .tabset-pills}\n\n\n")
+DimPlot(Mal_bbknn, reduction = "umap", group.by = "tissue", label = TRUE,
+             label.size = 3 , repel = TRUE) + NoLegend()
+DimPlot(Mal_bbknn, reduction = "umap", group.by = "Malignant_T")
+```
+
+```{r, eval=FALSE,include=FALSE}
+saveRDS(Mal_bbknn,"/CTCL_Malignant_T.rds") 
+```
