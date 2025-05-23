@@ -1,0 +1,166 @@
+Tcell clustering and annotation blood
+
+```{r, include = FALSE}
+library(Seurat)
+library(SCpubr)
+library(ggplot2)
+library(viridis)
+library(paletteer)
+library(RColorBrewer)
+library(dplyr)
+library(ggplot2)
+library(dplyr)
+library(UCell)
+library(DT)
+library(htmltools)
+library(knitr)
+```
+
+```{r }
+seu_T <- readRDS(/BLOOD_Tcells.rds") #This is the object with all T-cells identified in the global blood object
+DefaultAssay(seu_T) <- "RNA"
+```
+
+```{r}
+seu_T$patient <- gsub("^P(\\d+)$", "blood \\1", seu_T$patient)
+seu_T$patient <- gsub("^HD(\\d+)$", "blood HD \\1", seu_T$patient)
+```
+
+#UMAP all Tcells
+```{r, Set Idents seu_CTCL}
+meta <- seu_T@meta.data
+
+meta$cellType <- as.character(meta$cellType)
+meta$cellType[meta$cellType == c("Prolif. T")] <- "Prolif T"
+meta$cellType[meta$cellType == c("Other T")] <- "NK TOX+"
+meta$cellType[meta$cellType == c("CD4 T p2")] <- "dn T"
+
+meta$Tcells <- meta$cellType
+
+meta$Tcells[meta$seurat_clusters %in% c("0", "5", "7", "8", "9", "13", "14", "18","20")] <- "Malignant TCM"
+meta$Tcells[meta$Tcells %in% c("CD16- NK", "CD16+ NK")] <- "NK"
+meta$Tcells[meta$Tcells %in% c("CD4 TCM1", "CD4 TCM2")] <- "CD4 TCM"
+meta$Tcells[meta$Tcells %in% c("CD4 CTL")] <- "CTL"
+meta$Tcells[meta$Tcells %in% c("CD8 TEM")] <- "CTL"
+meta$Tcells[meta$Tcells %in% c("CD8 TOX+")] <- "NK TOX+"
+meta$Tcells[meta$Tcells %in% c("Tregs")] <- "Treg"
+
+seu_T <- AddMetaData(seu_T,meta)
+``` 
+
+
+```{r}
+seu_T <- subset(seu_T, subset = Tcells != "CD4 T p1") # too few cells
+```
+
+```{r, fig.height=5, fig.width=5}
+col_as <- as.character()
+
+# Manually set the color for "Malignant T TCM" to dark navy blue
+col_as[["Malignant TCM"]] <- "#000080"  
+col_as[["CD4 naive T"]] <- "#1CBE4FFF"
+col_as[["CD4 TCM"]] <- "#90AD1CFF"
+col_as[["CD4 TEM"]] <- "#1C8356FF"
+col_as[["Treg"]] <- "#006600FF"
+col_as[["CTL"]] <- "#664466FF"
+col_as[["CD8 naive T"]] <- "#CC99CCFF"
+col_as[["CD8 TEM"]] <- "#FF9966FF"
+col_as[["gdT"]] <- "#BB6622FF"
+col_as[["Prolif T"]] <- "#FFCC99FF"
+col_as[["NK TOX+"]] <- "#CC6666FF"
+col_as[["NK"]] <- "#882211FF"
+
+seu_T <- SetIdent(seu_T, value = seu_T@meta.data$Tcells)
+do_DimPlot(seu_T, 
+           pt.size = 0.3, 
+           reduction = "umap",
+           plot.axes = TRUE,
+           label = FALSE,
+           label.box = FALSE,
+           label.size = 4,
+           repel = TRUE,
+           legend.position = "right",
+           plot.title = "",
+           order = c("NK","NK TOX+","Prolif T","gdT","CD8 TEM","CD8 naive T","CTL","Treg","CD4 TEM","CD4 TCM","CD4 naive T", "Malignant TCM"),
+           colors.use = col_as)
+```
+
+# stacked barplot per patient
+```{r, fig.height=5, fig.width=5}
+# Extract metadata
+metadata <- seu_T@meta.data
+
+# Ensure the T cell types are in the specified order
+metadata$Tcells <- factor(metadata$Tcells, 
+                          levels = c("Malignant TCM", "CD4 naive T", "CD4 TCM", "CD4 TEM", "Treg", "CTL", "CD8 naive T",  "CD8 TEM",  "gdT", "Prolif T", "NK TOX+", "NK"))
+
+# Count the number of cells per sample and T cell type
+cell_counts <- metadata %>%
+  group_by(patient, Tcells) %>%
+  summarise(count = n(), .groups = "drop")
+
+# Optional: Normalize to proportions within each sample
+cell_counts <- cell_counts %>%
+  group_by(patient) %>%
+  mutate(proportion = count / sum(count))
+
+# Define colors (assuming col_as is a named vector with colors corresponding to T cell types)
+color_palette <- col_as[names(col_as) %in% levels(metadata$Tcells)]
+
+# Plot stacked barplot
+ggplot(cell_counts, aes(x = patient, y = proportion, fill = Tcells)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = color_palette) +
+  labs(x = "Sample", y = "Proportion", fill = "T Cell Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+```
+
+
+# Dotplot typing markers
+```{r, fig.height=5, fig.width=10}
+seu_T$Tcells <- factor(seu_T$Tcells, levels = rev(c("Malignant TCM","CD4 naive T","CD4 TCM","CD4 TEM","Treg","CTL","CD8 naive T","CD8 TEM","gdT","NK TOX+","NK","Prolif T")))
+
+seu_T <- SetIdent(seu_T, value = seu_T@meta.data$Tcells)
+DefaultAssay(seu_T) <- "RNA" 
+
+man <- c("CD3E", "CD3D", "CD4",
+         "TOX","TSHZ2","SESN3","DNM3",  # Malignant TCM
+         "TCF7", "LEF1", "CCR7", #CD4 naive T
+         "ITGB1",  "AQP3", # CD4 TCM
+         "IL32", "CCL5", "GZMK",  # CD4 TEM
+         "FOXP3", "IL2RA", # Treg
+         "CD8A", "CD8B", "GZMB", "NKG7",# CTL
+         # CD8 naive T
+         # CD8 TOX
+         "TRGC1","TRGC2",# gdT
+         "KLRF1", #NK TOX
+         "NCAM1", "FCGR3A",  # NK
+         "PCNA", "MKI67"# Prolif T
+        )
+
+DotPlot(seu_T, group.by = "Tcells", features = man) + theme(axis.text.x = element_text(angle = 90)) +scale_colour_gradient2(low="lightgreen", mid="lightgrey", high="coral")
+```
+
+#UMAP colored by patient
+```{r, fig.height = 10, fig.width= 10}
+
+colors <- paletteer_d("trekcolors::lcars_series")
+colors <- colors[1:(length(unique(seu_T$patient)))] 
+col_as <- setNames(colors, unique(seu_T$patient))
+do_DimPlot(seu_T, 
+           pt.size = 0.3, 
+           reduction = "umap",
+           group.by = "patient",
+           split.by = "patient",
+           plot.axes = TRUE,
+           label = FALSE,
+           label.box = FALSE,
+           label.size = 4,
+           repel = TRUE,
+           legend.position = "right",
+           plot.title = "",
+           order = c("blood HD 3", "blood HD 2", "blood HD 1", "blood 8", "blood 7", "blood 6", "blood 5", "blood 4", "blood 3", "blood 2", "blood 1"),
+           colors.use = col_as)
+```
