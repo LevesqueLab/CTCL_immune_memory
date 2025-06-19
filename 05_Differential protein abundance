@@ -1,59 +1,134 @@
-```{r}
-library(Seurat)
-library(ggplot2)
-library(dplyr)
-library(DT)
-library(htmltools)
-library(future)     # for multicore setup
-```
-# Differential protein abundance Malignant T vs CD4 T in CTCL blood
-```{r }
-seu_T <- readRDS("/BLOOD_Tcells.rds") #read CTCL blood Tcells with final typing
-seu_sub <- subset(seu_T, subset = Tcells %in% c("Malignant TCM", "CD4 naive T", "CD4 TCM", "CD4 TEM"))
-```
+#!/usr/bin/env Rscript
 
-```{r, Set Idents seu_CTCL}
-meta <- seu_sub@meta.data
-meta$Tcells[meta$Tcells %in% c("CD4 naive T", "CD4 TCM", "CD4 TEM")] <- "CD4 T"
-seu_sub <- AddMetaData(seu_sub,meta)
-``` 
+#' CTCL Blood: Differential Protein Abundance Analysis
+#'
+#' This script performs differential abundance testing of surface proteins (ADT)
+#' between malignant T-cells and non-malignant CD4 T-cells in CTCL blood samples.
+#' It also explores marker proteins within malignant subpopulations using LR tests
+#' with patient-level covariate correction.
+#'
+#' Dependencies: Seurat, dplyr, ggplot2, qs (for qread)
 
-## Proteinlist
-```{r, paged.print=FALSE, results='asis'}
-DefaultAssay(seu_sub) <- "ADT"
-seu_sub <- SetIdent(seu_sub, value = seu_sub@meta.data$Tcells)
-bulk.TCMMal.de <- FindAllMarkers(object = seu_sub, 
-                         test.use = "LR", latent.vars = "patient",  return.thresh = 0.05) 
+# Load required libraries
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(future)
+  library(qs)
+})
 
-bulk.TCMMal.de$Protein <- rownames(bulk.TCMMal.de)
-top <- bulk.TCMMal.de %>%
-        filter(p_val_adj < 0.01)
+# Set up parallel processing
+plan("multicore", workers = 4)
 
-top8 <- bulk.TCMMal.de %>%
-        top_n(8, avg_log2FC) %>% pull (gene)
+# ------------------------------------------------------------------------------
+# Section 1: Between-group ADT comparison (Malignant TCM vs. CD4 T-cells)
+# ------------------------------------------------------------------------------
 
-DotPlot(seu_sub, group.by = "Tcells", features = top8) + theme(axis.text.x = element_text(angle = 90)) +scale_colour_gradient2(low="lightgreen", mid="lightgrey", high="coral")
-```
+#' Load and preprocess Seurat object for blood T-cell protein comparison
+load_blood_tcells <- function(path) {
+  cat("Loading and subsetting blood T-cell data...\n")
+  seu <- readRDS(path)
+  seu_sub <- subset(seu, subset = Tcells %in% c("Malignant TCM", "CD4 naive T", "CD4 TCM", "CD4 TEM"))
+  
+  # Merge CD4 subtypes
+  meta <- seu_sub@meta.data
+  meta$Tcells[meta$Tcells %in% c("CD4 naive T", "CD4 TCM", "CD4 TEM")] <- "CD4 T"
+  seu_sub <- AddMetaData(seu_sub, meta)
+  return(seu_sub)
+}
 
-# Differential protein abundance within Malignant subpopulations 
-```{r}
-seu_Mal <- qread(("/CTCLblood_Malignant_T.qs")) #import CTCL blood Malignant T-cells object with finalized typing 
-DefaultAssay(seu_Mal) <- "ADT"
-seu_Mal <- SetIdent(seu_Mal, value = seu_Mal@meta.data$Malignant_T)
-```
-```{r, paged.print=FALSE, results='asis'}
-bulk.TCMMal.de <- FindAllMarkers(object = seu_Mal, 
-                         test.use = "LR", latent.vars = "patient",  return.thresh = 0.05) 
+#' Perform differential ADT analysis (Malignant TCM vs CD4 T)
+run_bulk_marker_test <- function(seu_obj) {
+  cat("Running differential protein abundance (Malignant TCM vs CD4 T)...\n")
+  DefaultAssay(seu_obj) <- "ADT"
+  seu_obj <- SetIdent(seu_obj, value = seu_obj$Tcells)
+  markers <- FindAllMarkers(
+    object = seu_obj,
+    test.use = "LR",
+    latent.vars = "patient",
+    return.thresh = 0.05
+  )
+  markers$Protein <- rownames(markers)
+  return(markers)
+}
 
-bulk.TCMMal.de$Protein <- rownames(bulk.TCMMal.de)
+#' Plot top protein markers between Malignant TCM vs CD4 T
+plot_top_bulk_markers <- function(markers_df, seu_obj, top_n = 8) {
+  top_proteins <- markers_df %>%
+    filter(p_val_adj < 0.01) %>%
+    top_n(top_n, avg_log2FC) %>%
+    pull(gene)
 
-top5 <- bulk.TCMMal.de %>%
-  filter(cluster == "mTCM") %>%
-        group_by(cluster) %>%
-        top_n(5, avg_log2FC)
-protein_list <- unique(top5$Protein)
-protein_list <- gsub("\\.1$", "", protein_list)
+  p <- DotPlot(seu_obj, features = top_proteins, group.by = "Tcells") +
+    theme(axis.text.x = element_text(angle = 90)) +
+    scale_colour_gradient2(low = "lightgreen", mid = "lightgrey", high = "coral") +
+    labs(title = "Top Differential Proteins (Malignant vs CD4 T)")
+  
+  print(p)
+}
 
-DotPlot(seu_Mal, group.by = "Malignant_T", features = protein_list) + theme(axis.text.x = element_text(angle = 90)) +scale_colour_gradient2(low="lightgreen", mid="lightgrey", high="coral")
-```
+# ------------------------------------------------------------------------------
+# Section 2: Within-malignant subgroup comparison
+# ------------------------------------------------------------------------------
+
+#' Load malignant T-cell Seurat object
+load_malignant_cells <- function(path) {
+  cat("Loading malignant T-cell object...\n")
+  seu <- qread(path)
+  DefaultAssay(seu) <- "ADT"
+  seu <- SetIdent(seu, value = seu$Malignant_T)
+  return(seu)
+}
+
+#' Run differential protein analysis within malignant subtypes
+run_malignant_marker_test <- function(seu_obj) {
+  cat("Running intra-malignant subtype marker discovery...\n")
+  markers <- FindAllMarkers(
+    object = seu_obj,
+    test.use = "LR",
+    latent.vars = "patient",
+    return.thresh = 0.05
+  )
+  markers$Protein <- rownames(markers)
+  return(markers)
+}
+
+#' Plot top proteins from a selected malignant subtype
+plot_malignant_markers <- function(markers_df, seu_obj, subtype = "mTCM", top_n = 5) {
+  top_proteins <- markers_df %>%
+    filter(cluster == subtype) %>%
+    group_by(cluster) %>%
+    top_n(top_n, avg_log2FC) %>%
+    pull(Protein) %>%
+    gsub("\\.1$", "", .) %>%
+    unique()
+
+  p <- DotPlot(seu_obj, features = top_proteins, group.by = "Malignant_T") +
+    theme(axis.text.x = element_text(angle = 90)) +
+    scale_colour_gradient2(low = "lightgreen", mid = "lightgrey", high = "coral") +
+    labs(title = paste("Top ADT Markers in", subtype))
+  
+  print(p)
+}
+
+# ------------------------------------------------------------------------------
+# Run Analysis
+# ------------------------------------------------------------------------------
+
+main <- function() {
+  # Part 1: Malignant vs CD4 T
+  seu_blood <- load_blood_tcells("/BLOOD_Tcells.rds")
+  markers_bulk <- run_bulk_marker_test(seu_blood)
+  plot_top_bulk_markers(markers_bulk, seu_blood)
+
+  # Part 2: Within malignant subtypes
+  seu_malignant <- load_malignant_cells("/CTCLblood_Malignant_T.qs")
+  markers_malignant <- run_malignant_marker_test(seu_malignant)
+  plot_malignant_markers(markers_malignant, seu_malignant)
+}
+
+# Execute
+main()
+
 
