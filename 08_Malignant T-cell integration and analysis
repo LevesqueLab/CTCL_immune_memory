@@ -1,105 +1,155 @@
-Malignant T-cell integration
+#!/usr/bin/env Rscript
 
-```{r, include = FALSE}
-library(Seurat)
-library(dplyr)
-library(bbknnR)
-library(SCpubr)
-library(future)
-library(RColorBrewer)
-library(DT)
-library(htmltools)
-```
+#' Malignant T-cell Integration (Blood and Skin)
+#'
+#' This script integrates malignant T-cell populations from CTCL blood and skin samples
+#' using multiple strategies (unintegrated reclustering, CCA, and BBKNN). It supports
+#' visualization of tissue origin, patient identity, and malignant subtype annotations.
+#'
+#' Dependencies: Seurat, SCpubr, bbknnR, dplyr, future, RColorBrewer, qs
 
-```{r }
-blood_T <- readRDS("/BLOOD_Tcells.rds") #read the typed blood T-cells 
-blood_T <- SetIdent(blood_T, value = blood_T@meta.data$TCM)
-DefaultAssay(blood_T) <- "RNA"
+# Load libraries
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(dplyr)
+  library(bbknnR)
+  library(SCpubr)
+  library(future)
+  library(RColorBrewer)
+  library(qs)
+})
 
+# Set parallelization and random seed
+plan("multicore", workers = 4)
+set.seed(123)
 
-skin_T <- readRDS("/rstudio-data/Andrea/Rstudio_server/home/Projects/scCTCL/CTCL_Skin/Data/MF_SS_Malignant_T.rds")
-skin_T <- SetIdent(skin_T, value = skin_T@meta.data$TCM)
-DefaultAssay(skin_T) <- "RNA"
-```
+#' Load and preprocess Seurat objects
+load_malignant_samples <- function(blood_path, skin_path) {
+  cat("Loading malignant T-cell Seurat objects...\n")
+  
+  blood <- readRDS(blood_path)
+  skin <- readRDS(skin_path)
+  
+  # Set identity to malignant subtype column
+  blood <- SetIdent(blood, value = blood$TCM)
+  skin <- SetIdent(skin, value = skin$TCM)
+  
+  DefaultAssay(blood) <- "RNA"
+  DefaultAssay(skin) <- "RNA"
+  
+  return(list(blood = blood, skin = skin))
+}
 
-```{r}
-#align metadata
-meta_s <- skin_T@meta.data
-meta_b <- blood_T@meta.data
+#' Harmonize metadata across samples
+harmonize_metadata <- function(blood, skin) {
+  cat("Aligning metadata and tagging tissue origin...\n")
+  
+  meta_b <- blood@meta.data %>% mutate(condition = ifelse(status == "CTCL", "SS", as.character(status)))
+  meta_s <- skin@meta.data
+  
+  common_cols <- intersect(names(meta_b), names(meta_s))
+  meta_b_common <- meta_b[, common_cols]
+  meta_s_common <- meta_s[, common_cols]
+  
+  meta_b_common$tissue <- "blood"
+  meta_s_common$tissue <- "skin"
+  
+  blood <- AddMetaData(blood, meta_b_common)
+  skin <- AddMetaData(skin, meta_s_common)
+  
+  return(list(blood = blood, skin = skin))
+}
 
-#modulate condition to indicate MF or SS
-meta_b$condition <- meta_b$status %>% as.character()
-meta_b <- meta_b %>%
-  mutate(condition = ifelse(condition == "CTCL", "SS", condition))
+#' Merge and normalize data
+normalize_and_merge <- function(blood, skin) {
+  cat("Merging and normalizing data with SCTransform...\n")
+  
+  blood <- SCTransform(blood, verbose = FALSE)
+  skin <- SCTransform(skin, verbose = FALSE)
+  
+  merged <- merge(skin, blood)
+  return(merged)
+}
 
-# Subset both dataframes to keep only the common columns
-only_in_skin <- setdiff(names(meta_s), names(meta_b))
-only_in_blood <- setdiff(names(meta_b), names(meta_s))
-common_columns <- intersect(names(meta_b), names(meta_s))
-meta_b_common <- meta_b[, common_columns]
-meta_s_common <- meta_s[, common_columns]
+#' Run unintegrated reclustering by tissue
+recluster_unintegrated <- function(seu_obj) {
+  cat("Performing unintegrated clustering split by tissue...\n")
+  
+  DefaultAssay(seu_obj) <- "RNA"
+  seu_obj[["RNA"]] <- JoinLayers(seu_obj[["RNA"]])
+  seu_obj[["RNA"]] <- split(seu_obj[["RNA"]], f = seu_obj$tissue)
+  
+  seu_obj <- SCTransform(seu_obj)
+  seu_obj <- RunPCA(seu_obj)
+  seu_obj <- FindNeighbors(seu_obj, dims = 1:30)
+  seu_obj <- FindClusters(seu_obj, resolution = 1, cluster.name = "unintegrated_clusters")
+  seu_obj <- RunUMAP(seu_obj, dims = 1:30, reduction.name = "umap.unintegrated")
+  
+  return(seu_obj)
+}
 
-# setup tissue metadata
-meta_b_common$tissue <- "blood"
-meta_s_common$tissue <- "skin"
+#' Run CCA-based integration
+run_cca_integration <- function(seu_obj) {
+  cat("Running CCA-based integration...\n")
+  
+  seu_obj <- IntegrateLayers(seu_obj, method = CCAIntegration, normalization.method = "SCT")
+  seu_obj[["RNA"]] <- JoinLayers(seu_obj[["RNA"]])
+  
+  seu_obj <- FindNeighbors(seu_obj, reduction = "integrated.dr", dims = 1:30)
+  seu_obj <- FindClusters(seu_obj, resolution = seq(0.1, 1, 0.1))
+  seu_obj <- RunUMAP(seu_obj, reduction = "integrated.dr", dims = 1:30)
+  
+  return(seu_obj)
+}
 
-#add modified metadata to object
-blood_T <- AddMetaData(blood_T,meta_b_common)
-skin_T <- AddMetaData(skin_T,meta_s_common)
+#' Run BBKNN integration
+run_bbknn_integration <- function(seu_obj) {
+  cat("Running BBKNN integration...\n")
+  
+  seu_obj$patient <- paste(seu_obj$tissue, seu_obj$patient, sep = "_")
+  seu_obj <- subset(seu_obj, subset = patient != "CTCL_10")  # remove problematic sample
+  
+  seu_obj <- RunBBKNN(seu_obj, batch_key = "patient")
+  seu_obj <- FindClusters(seu_obj, graph.name = "bbknn", resolution = seq(0.1, 1, 0.1))
+  
+  return(seu_obj)
+}
 
-# Normalize both datasets using SCTransform 
-skin_T <- SCTransform(skin_T, verbose = FALSE)
-blood_T <- SCTransform(blood_T, verbose = FALSE)
+#' Visualize UMAPs
+plot_umaps <- function(seu_obj, label_group = "tissue", split_group = "Malignant_T") {
+  p1 <- DimPlot(seu_obj, reduction = "umap", group.by = label_group, label = TRUE, label.size = 3, repel = TRUE) + NoLegend()
+  p2 <- DimPlot(seu_obj, reduction = "umap", group.by = split_group)
+  print(p1 + p2)
+}
 
-# merge
-blood.skin.merged <- merge(skin_T, blood_T)
-```
+# Main pipeline
+main <- function() {
+  # Load and merge data
+  paths <- list(
+    blood = "/BLOOD_Tcells.rds",
+    skin = "/SKIN_Malignant_T.rds"
+  )
+  
+  data <- load_malignant_samples(paths$blood, paths$skin)
+  data <- harmonize_metadata(data$blood, data$skin)
+  merged <- normalize_and_merge(data$blood, data$skin)
+  
+  # --- Unintegrated Reclustering ---
+  reclustered <- recluster_unintegrated(merged)
+  DimPlot(reclustered, reduction = "umap.unintegrated", group.by = c("tissue", "patient"))
+  
+  # --- CCA Integration ---
+  integrated <- run_cca_integration(merged)
+  DimPlot(integrated, reduction = "integrated.dr", group.by = c("tissue", "patient"))
+  
+  # --- BBKNN Integration ---
+  bbknn_result <- run_bbknn_integration(integrated)
+  plot_umaps(bbknn_result)
+  
+  # Optional save
+  # saveRDS(bbknn_result, "/CTCL_Malignant_T.rds")
+}
 
-## Reclustering without integration {.tabset}
-Samples are split by tissue type
-```{r , results='hide'}
-DefaultAssay(blood.skin.merged) <- "RNA"
-blood.skin.merged[["RNA"]] <- JoinLayers(blood.skin.merged[["RNA"]])
-blood.skin.merged[["RNA"]] <- split(blood.skin.merged[["RNA"]], f = blood.skin.merged$tissue)
-blood.skin.merged <- SCTransform(blood.skin.merged)
-blood.skin.merged <- RunPCA(blood.skin.merged)
-blood.skin.merged <- FindNeighbors(blood.skin.merged, dims = 1:30, reduction = "pca")
-blood.skin.merged <- FindClusters(blood.skin.merged, resolution = 1, cluster.name = "unintegrated_clusters")
-blood.skin.merged <- RunUMAP(blood.skin.merged, dims = 1:30, reduction = "pca", reduction.name = "umap.unintegrated")
-DimPlot(blood.skin.merged, reduction = "umap.unintegrated", group.by = c("tissue", "patient"))
-```
+# Run pipeline
+main()
 
-## CCA Integration 
-```{r, results='hide'}
-blood.skin.merged <- IntegrateLayers(object = blood.skin.merged, method = CCAIntegration, verbose = FALSE, normalization.method = "SCT")
-blood.skin.merged[["RNA"]] <- JoinLayers(blood.skin.merged[["RNA"]])
-
-blood.skin.merged <- FindNeighbors(blood.skin.merged, reduction = "integrated.dr", dims = 1:30)
-blood.skin.merged <- FindClusters(blood.skin.merged, resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1))
-blood.skin.merged <- RunUMAP(blood.skin.merged, dims = 1:30, reduction = "integrated.dr")
-```
-
-```{r, fig.width=14}
-blood.skin.merged <- RunUMAP(blood.skin.merged, dims = 1:30, reduction = "pca", reduction.name = "umap")
-DimPlot(blood.skin.merged, reduction = "integrated.dr", group.by = c("tissue","patient"))
-```
-
-# BBKNN-integration {.tabset .tabset-pills}
-```{r, include = FALSE}
-blood.skin.merged$patient <- paste(blood.skin.merged$tissue, blood.skin.merged$patient, sep ="_")
-bs_min <- subset(blood.skin.merged, subset = patient %in% c("CTCL_10"), invert = TRUE) #as no malignant T-cells detected
-
-Mal_bbknn <- RunBBKNN(bs_min, batch_key = "patient") 
-Mal_bbknn <- FindClusters(Mal_bbknn, graph.name = "bbknn", resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1))
-```
-
-```{r, results='asis', fig.width=5, fig.height=5}
-cat("\n\n\n\n## ", "UMAP", " {.tabset .tabset-pills}\n\n\n")
-DimPlot(Mal_bbknn, reduction = "umap", group.by = "tissue", label = TRUE,
-             label.size = 3 , repel = TRUE) + NoLegend()
-DimPlot(Mal_bbknn, reduction = "umap", group.by = "Malignant_T")
-```
-
-```{r, eval=FALSE,include=FALSE}
-saveRDS(Mal_bbknn,"/CTCL_Malignant_T.rds") 
-```
