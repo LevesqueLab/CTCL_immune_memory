@@ -103,6 +103,21 @@ main <- function() {
 
   cat("Generating volcano plot...\n")
   print(plot_volcano(posthoc_res))
+
+  cat("Generating per-protein plots...\n")
+  for (protein in significant_proteins) {
+    plots <- olink_lmer_plot(
+      df = data,
+      olinkid_list = protein,
+      variable = "Disease",
+      x_axis_variable = "Disease",
+      random = "Patient",
+      covariates = c("Age", "Sex"),
+      number_of_proteins_per_plot = 1
+   )
+    print(plots[[1]])
+}
+
 }
 
 # Run the workflow
