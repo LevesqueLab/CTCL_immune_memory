@@ -112,7 +112,7 @@ plot_infercnv_heatmap <- function(hmm_path, seu, sample_type = "blood") {
     clusters <- meta %>% select(barcode = rownames(meta), Tcells, patient) %>% arrange(Tcells, patient)
     celltype_colors <- c(
       "Malignant TCM" = "#000080", "Malignant IS" = "#0011EEFF", "CD4 TRM" = "#66CC33FF",
-      "CD4 TRMr" = "#BBAA55FF", "Treg" = "#006600FF", "CD8 T" = "#DD6644FF", "NK" = "#882211FF"
+      "CD4 TEM" = "#BBAA55FF", "Treg" = "#006600FF", "CD8 T" = "#DD6644FF", "NK" = "#882211FF"
     )
   }
   
