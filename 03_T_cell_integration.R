@@ -128,7 +128,7 @@ annotate_skin_tcells <- function(seurat_obj) {
   meta$Tcells[meta$RNA_snn_res.1 %in% c("5", "9")] <- "Malignant IS"
   meta$Tcells[meta$RNA_snn_res.1 %in% c("4")] <- "Treg"
   meta$Tcells[meta$RNA_snn_res.1 %in% c("0")] <- "CD4 TRM"
-  meta$Tcells[meta$RNA_snn_res.1 %in% c("1")] <- "CD4 TRMr"
+  meta$Tcells[meta$RNA_snn_res.1 %in% c("1")] <- "CD4 TEM"
   meta$Tcells[meta$RNA_snn_res.1 %in% c("7")] <- "CD8 T"
   meta$Tcells[meta$RNA_snn_res.1 %in% c("8")] <- "NK"
   
@@ -171,7 +171,7 @@ create_tcell_color_palette <- function(tissue_type = "blood") {
       "Malignant TCM" = "#000080",
       "Malignant IS" = "#0011EEFF",
       "CD4 TRM" = "#66CC33FF",
-      "CD4 TRMr" = "#BBAA55FF",
+      "CD4 TEM" = "#BBAA55FF",
       "Treg" = "#006600FF",
       "CD8 T" = "#DD6644FF",
       "NK" = "#882211FF"
@@ -197,7 +197,7 @@ plot_tcell_umap <- function(seurat_obj, tissue_type = "blood", reduction = "umap
     cell_order <- c("NK", "NK TOX+", "Prolif T", "gdT", "CD8 TEM", "CD8 naive T", 
                    "CTL", "Treg", "CD4 TEM", "CD4 TCM", "CD4 naive T", "Malignant TCM")
   } else {
-    cell_order <- c("NK", "CD8 T", "Treg", "CD4 TRM", "CD4 TRMr", "Malignant IS", "Malignant TCM")
+    cell_order <- c("NK", "CD8 T", "Treg", "CD4 TRM", "CD4 TEM", "Malignant IS", "Malignant TCM")
   }
   
   # Set identities
@@ -273,7 +273,7 @@ plot_tcell_proportions <- function(seurat_obj, tissue_type = "blood") {
     cell_levels <- c("Malignant TCM", "CD4 naive T", "CD4 TCM", "CD4 TEM", "Treg", 
                     "CTL", "CD8 naive T", "CD8 TEM", "gdT", "Prolif T", "NK TOX+", "NK")
   } else {
-    cell_levels <- c("Malignant TCM", "Malignant IS", "CD4 TRM", "CD4 TRMr", 
+    cell_levels <- c("Malignant TCM", "Malignant IS", "CD4 TRM", "CD4 TEM", 
                     "Treg", "CD8 T", "NK")
   }
   
@@ -343,7 +343,7 @@ plot_tcell_markers <- function(seurat_obj, tissue_type = "blood") {
     )
     
     # Set factor levels
-    cell_levels <- c("NK", "CD8 T", "CD4 TRMr", "CD4 TRM", "Treg", 
+    cell_levels <- c("NK", "CD8 T", "CD4 TEM", "CD4 TRM", "Treg", 
                     "Malignant IS", "Malignant TCM")
   }
   
