@@ -5,8 +5,6 @@
 #' This script processes T-cell receptor (TCR) sequencing data from CellRanger output
 #' and performs comprehensive TCR repertoire analysis including clonotype identification,
 #' diversity analysis, and integration with single-cell RNA-seq data.
-#'
-#' Based on the CTCL single-cell memory manuscript analysis pipeline
 
 # Load required libraries
 suppressPackageStartupMessages({
