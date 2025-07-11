@@ -1,12 +1,10 @@
 #!/usr/bin/env Rscript
 
-#' T-cell Integration and Clustering Analysis (without TCR genes)
+#' T-cell Clustering Analysis (without TCR genes)
 #' 
 #' This script performs T-cell clustering and annotation without TCR genes
 #' to avoid bias from clonal expansion. It includes both blood and skin
 #' T-cell analysis from the CTCL single-cell memory manuscript.
-#'
-#' Based on the CTCL manuscript analysis pipeline
 
 # Load required libraries
 suppressPackageStartupMessages({
