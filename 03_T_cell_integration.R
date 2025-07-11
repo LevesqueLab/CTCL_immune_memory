@@ -451,15 +451,5 @@ process_tcell_integration <- function(blood_tcells_path, skin_tcells_path,
   return(results)
 }
 
-# Example usage (uncomment and modify paths as needed):
-# 
-# # Process T-cell integration
-# results <- process_tcell_integration(
-#   blood_tcells_path = "path/to/BLOOD_Tcells.rds",
-#   skin_tcells_path = "path/to/SKIN_Tcells.rds",
-#   output_dir = "Tcell_integration_results",
-#   remove_tcr_genes = TRUE
-# )
-
 cat("T-cell integration script loaded successfully!\n")
-cat("Use process_tcell_integration() to run the complete analysis pipeline.\n")
+
