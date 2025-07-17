@@ -5,8 +5,6 @@
 #' This script processes Xenium spatial transcriptomics data including
 #' preprocessing, segmentation, RCTD deconvolution, and analysis.
 #' It reproduces the spatial analysis from the CTCL single-cell memory manuscript.
-#'
-#' Based on the CTCL manuscript analysis pipeline
 
 # Load required libraries
 suppressPackageStartupMessages({
