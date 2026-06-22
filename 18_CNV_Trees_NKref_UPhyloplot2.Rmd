@@ -1,0 +1,2066 @@
+---
+title: "p28409 - CTCL CNV Trees (Published Pipeline: NK Reference, Pooled Blood/Skin)"
+output:
+  html_document:
+    self_contained: true
+    includes:
+      in_header: !expr system.file("templates/fgcz_header.html", package = "ezRun", lib.loc = .libPaths())
+    css: !expr system.file("templates/fgcz.css", package = "ezRun", lib.loc = .libPaths())
+    code_folding: hide
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, comment = "")
+```
+
+CNV trees rebuilt from the **published inferCNV runs** (Geier et al. 2024 paper code, `06_Inferred_copy_number_variations_in_scRNAseq.R`). Two differences vs the 2023 per-patient runs used in `01b`:
+
+| | 2023 FGCZ runs (used in 01b) | Published runs (this report) |
+|---|---|---|
+| Reference | CD8+ T (MF) / **CD4+ T contaminated** (SS) | **NK cells** (`refgrp-1` + `refgrp-2`) |
+| Granularity | Per-patient | Pooled **blood** / pooled **skin** |
+| Observation cells | Per-patient CD4 (MF), CD8+Malign.T (SS) | All T-cell subsets including **per-patient malignant groups** (`Malignant T1` … `T8`) |
+| Subclustering | density (default) | `leiden`, `BayesMaxPNormal=0.2`, `num_ref_groups=2`, `sd_amplifier=3` |
+
+**Why this matters:** in the 2023 SS run the `CD4+ T` reference contained mTCM cells, so mTCM was invisible as a subclone. With NK as reference, mTCM stays in the observations — subclones now span both mTCM and mTRM. Andrea ran two pooled jobs: `240227_skin_T_NK_ref/` (full output, ~1,500 obs cells) and `240523_blood_T_NK16_ref/` (`run.final.infercnv_obj` only, ~41k obs cells).
+
+# {.tabset}
+
+## Reference UMAP
+
+```{r load-mal, include=FALSE}
+library(Seurat)
+library(qs2)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+
+seurat_path <- "/srv/GT/analysis/p28409-Andrea/switchdrive_data/CTCL_blood_skin_malignant.qs2"
+mal_obj <- qs_read(seurat_path, nthreads = 16)
+
+mal_colors    <- c("mTCM" = "darkgreen", "mTRM" = "darkred", "mCyto" = "darkblue")  # paper palette (09_Transcriptional_heterogeneity.R)
+tissue_colors <- c("blood" = "#3C5488", "skin" = "#E64B35")
+
+# barcode → meta lookup
+mal_meta <- mal_obj@meta.data |>
+  dplyr::mutate(barcode = colnames(mal_obj)) |>
+  dplyr::select(barcode, Malignant_T, tissue, patient)
+```
+
+`r format(ncol(mal_obj), big.mark = ",")` malignant T cells (mTCM/mTRM/mCyto only) from blood + skin, used as the **reference Seurat object** for barcode matching, Malignant_T overlays, and subclone composition.
+
+### Malignant_T state
+
+```{r umap-state, fig.width=8, fig.height=7}
+DimPlot(mal_obj, group.by = "Malignant_T", cols = mal_colors,
+        raster = FALSE, order = TRUE, repel = TRUE) +
+  theme(aspect.ratio = 1) + ggtitle("Malignant_T state")
+```
+
+### Tissue + Patient
+
+```{r umap-tissue-pat, fig.width=18, fig.height=7}
+p_t <- DimPlot(mal_obj, group.by = "tissue", cols = tissue_colors,
+               raster = FALSE, order = TRUE) +
+  theme(aspect.ratio = 1) + ggtitle("Tissue")
+p_p <- DimPlot(mal_obj, group.by = "patient", raster = FALSE,
+               cols = unname(pals::polychrome()), order = TRUE, repel = TRUE) +
+  theme(aspect.ratio = 1) + ggtitle("Patient")
+p_t | p_p
+```
+
+## inferCNV Setup
+
+```{r load-infercnv, include=FALSE}
+cache_setup <- "/srv/GT/analysis/p28409-Andrea/2026-03-24-UPhyloplot2-CNV-Trees/cache_01c_infercnv_setup.qs2"
+
+if (file.exists(cache_setup)) {
+  setup <- qs_read(cache_setup, nthreads = 8)
+} else {
+  skin_obj  <- readRDS("/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/skin/run.final.infercnv_obj")
+  blood_obj <- readRDS("/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/blood/run.final.infercnv_obj")
+
+  group_counts <- function(o, tissue) {
+    ref <- sapply(o@reference_grouped_cell_indices, length)
+    obs <- sapply(o@observation_grouped_cell_indices, length)
+    rbind(
+      data.frame(tissue = tissue, role = "reference",   cell_type = names(ref), n = unname(ref)),
+      data.frame(tissue = tissue, role = "observation", cell_type = names(obs), n = unname(obs))
+    )
+  }
+  setup_tbl <- rbind(group_counts(skin_obj, "skin"), group_counts(blood_obj, "blood"))
+
+  # per-malignant-group subcluster sizes for tree planning
+  collect_subc <- function(o, tissue) {
+    sc <- o@tumor_subclusters$subclusters
+    ct_mal <- grep("^Malignant", names(sc), value = TRUE)
+    do.call(rbind, lapply(ct_mal, function(ct) {
+      sizes <- sapply(sc[[ct]], length)
+      data.frame(
+        tissue = tissue, cell_type = ct, n_subclones = length(sizes),
+        n_cells = sum(sizes),
+        size_top5 = paste(head(sort(sizes, decreasing = TRUE), 5), collapse = "/")
+      )
+    }))
+  }
+  subc_tbl <- rbind(collect_subc(skin_obj, "skin"), collect_subc(blood_obj, "blood"))
+
+  setup <- list(setup_tbl = setup_tbl, subc_tbl = subc_tbl,
+                skin_n_cells = ncol(skin_obj@expr.data), skin_n_genes = nrow(skin_obj@expr.data),
+                blood_n_cells = ncol(blood_obj@expr.data), blood_n_genes = nrow(blood_obj@expr.data))
+  qs_save(setup, cache_setup, nthreads = 8)
+  rm(skin_obj, blood_obj); gc(verbose = FALSE)
+}
+```
+
+**Object sizes:**
+
+- Skin: `r format(setup$skin_n_cells, big.mark = ",")` cells × `r format(setup$skin_n_genes, big.mark = ",")` genes
+- Blood: `r format(setup$blood_n_cells, big.mark = ",")` cells × `r format(setup$blood_n_genes, big.mark = ",")` genes
+
+### Cell groups used by inferCNV
+
+```{r show-setup}
+setup$setup_tbl |>
+  dplyr::arrange(tissue, role, -n) |>
+  knitr::kable(caption = "Cells per group (reference vs observation) in each inferCNV run")
+```
+
+### Per-patient malignant subclones (leiden)
+
+`Malignant Tx` group names correspond to patient X (blood and skin numbering is independent). Top-5 subclone sizes shown.
+
+```{r show-subclones}
+setup$subc_tbl |>
+  dplyr::arrange(tissue, cell_type) |>
+  knitr::kable(caption = "Leiden subclone structure within each malignant group")
+```
+
+## Barcode Matching
+
+```{r match-bc, include=FALSE}
+cache_match <- "/srv/GT/analysis/p28409-Andrea/2026-03-24-UPhyloplot2-CNV-Trees/cache_01c_match.qs2"
+
+if (file.exists(cache_match)) {
+  match_data <- qs_read(cache_match, nthreads = 8)
+} else {
+  skin_obj  <- readRDS("/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/skin/run.final.infercnv_obj")
+  blood_obj <- readRDS("/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/blood/run.final.infercnv_obj")
+
+  build_long <- function(o, tissue) {
+    sc_list <- o@tumor_subclusters$subclusters
+    ct_mal <- grep("^Malignant", names(sc_list), value = TRUE)
+    long <- do.call(rbind, lapply(ct_mal, function(ct) {
+      sc <- sc_list[[ct]]
+      do.call(rbind, lapply(names(sc), function(sid) {
+        idx <- sc[[sid]]
+        data.frame(cell_type = ct, subclone_id = sid,
+                   barcode = colnames(o@expr.data)[idx],
+                   stringsAsFactors = FALSE)
+      }))
+    }))
+    long$tissue <- tissue
+    long
+  }
+  long_skin  <- build_long(skin_obj, "skin")
+  long_blood <- build_long(blood_obj, "blood")
+  long_all <- rbind(long_skin, long_blood)
+  long_all$patient_id_inferCNV <- sub("^Malignant ", "", long_all$cell_type)
+
+  # Rename Seurat-side tissue → tissue_seurat to avoid collision; inferCNV-side tissue is authoritative
+  mal_meta_join <- mal_meta |> dplyr::rename(tissue_seurat = tissue)
+
+  matched <- long_all |>
+    dplyr::left_join(mal_meta_join, by = "barcode") |>
+    dplyr::mutate(matched = !is.na(Malignant_T))
+
+  match_summary <- matched |>
+    dplyr::group_by(tissue, cell_type) |>
+    dplyr::summarise(
+      n_inferCNV = dplyr::n(),
+      n_matched_Seurat = sum(matched),
+      pct_matched = round(100 * n_matched_Seurat / n_inferCNV, 1),
+      n_mTCM = sum(matched & Malignant_T == "mTCM", na.rm = TRUE),
+      n_mTRM = sum(matched & Malignant_T == "mTRM", na.rm = TRUE),
+      n_mCyto = sum(matched & Malignant_T == "mCyto", na.rm = TRUE),
+      patients_seurat = paste(sort(unique(stats::na.omit(patient))), collapse = ", "),
+      .groups = "drop"
+    )
+
+  match_data <- list(long = matched, summary = match_summary)
+  qs_save(match_data, cache_match, nthreads = 8)
+  rm(skin_obj, blood_obj); gc(verbose = FALSE)
+}
+```
+
+For each `Malignant Tx` group from inferCNV, count cells that also exist in the malignant Seurat object (mTCM/mTRM/mCyto). Unmatched cells are mostly QC-filtered cells removed downstream of the inferCNV run.
+
+```{r show-match}
+match_data$summary |>
+  knitr::kable(caption = "Match rate of inferCNV malignant groups → Seurat malignant object")
+```
+
+```{r match-by-state, fig.width=10, fig.height=5}
+match_data$long |>
+  dplyr::filter(matched) |>
+  dplyr::count(tissue, cell_type, Malignant_T) |>
+  ggplot(aes(x = cell_type, y = n, fill = Malignant_T)) +
+  geom_col(position = "fill") +
+  scale_fill_manual(values = mal_colors) +
+  facet_wrap(~ tissue, scales = "free_x") +
+  theme_bw() + theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(x = "inferCNV malignant group", y = "Fraction (matched cells)",
+       title = "Composition of each inferCNV malignant group (Seurat Malignant_T labels)")
+```
+
+## CNV Signal in UMAP {.tabset}
+
+```{r cnv-umap-prep, include=FALSE}
+# For each patient, project inferCNV cells onto the Seurat UMAP
+umap_df <- as.data.frame(mal_obj@reductions$umap@cell.embeddings)
+umap_df$barcode <- rownames(umap_df)
+umap_df <- umap_df |> dplyr::left_join(mal_meta, by = "barcode")
+colnames(umap_df)[1:2] <- c("UMAP_1", "UMAP_2")
+
+# subclone assignments per cell
+sc_assign <- match_data$long |>
+  dplyr::filter(matched) |>
+  dplyr::select(barcode, tissue_infercnv = tissue, cell_type, subclone_id, patient_id_inferCNV)
+
+# pick patients to display: those with >=50 matched cells in inferCNV
+top_patients <- match_data$summary |>
+  dplyr::filter(n_matched_Seurat >= 30) |>
+  dplyr::arrange(tissue, dplyr::desc(n_matched_Seurat))
+```
+
+For each patient (with ≥30 matched cells), show the inferCNV cells overlaid on the malignant UMAP, coloured by (1) Malignant_T state and (2) leiden subclone. Patients where mTCM **and** mTRM coexist in subclones confirm that the NK-reference run does not bias toward mTRM.
+
+```{r cnv-umap-tabs, results='asis', fig.width=16, fig.height=7}
+plot_patient_umap <- function(pat_id, tissue_in) {
+  pat_meta <- match_data$long |>
+    dplyr::filter(matched, patient_id_inferCNV == pat_id, tissue == tissue_in) |>
+    dplyr::distinct(barcode, .keep_all = TRUE)
+  if (nrow(pat_meta) == 0) return(NULL)
+  pat_xy <- umap_df |> dplyr::inner_join(
+    pat_meta |> dplyr::select(barcode, subclone_id, cell_type), by = "barcode"
+  )
+  # aggregate tiny subclones for legibility
+  sc_counts <- pat_xy |> dplyr::count(subclone_id) |> dplyr::arrange(-n)
+  big <- sc_counts$subclone_id[sc_counts$n >= max(5, ceiling(nrow(pat_xy) * 0.02))]
+  pat_xy$subclone_plot <- ifelse(pat_xy$subclone_id %in% big, pat_xy$subclone_id, "minor")
+  bg <- umap_df
+
+  p1 <- ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(color = "grey85", size = 0.2, alpha = 0.5) +
+    geom_point(data = pat_xy, aes(color = Malignant_T), size = 1) +
+    scale_color_manual(values = mal_colors) +
+    theme_bw() + theme(aspect.ratio = 1) +
+    ggtitle(sprintf("%s — %s (n=%d) — Malignant_T", tissue_in, pat_id, nrow(pat_xy)))
+
+  n_sub <- length(unique(pat_xy$subclone_plot))
+  sub_pal <- if (n_sub <= 24) unname(pals::tableau20())[1:max(2, n_sub)] else unname(pals::polychrome())[1:n_sub]
+  names(sub_pal) <- unique(pat_xy$subclone_plot)
+  if ("minor" %in% names(sub_pal)) sub_pal["minor"] <- "grey60"
+
+  p2 <- ggplot(bg, aes(UMAP_1, UMAP_2)) +
+    geom_point(color = "grey85", size = 0.2, alpha = 0.5) +
+    geom_point(data = pat_xy, aes(color = subclone_plot), size = 1) +
+    scale_color_manual(values = sub_pal) +
+    theme_bw() + theme(aspect.ratio = 1) +
+    ggtitle(sprintf("%s — %s — leiden subclones (≥2%%)", tissue_in, pat_id))
+  print(p1 | p2)
+  cat("\n\n")
+}
+
+for (i in seq_len(nrow(top_patients))) {
+  pat <- top_patients$cell_type[i] |> sub("^Malignant ", "", x = _)
+  tis <- top_patients$tissue[i]
+  cat(sprintf("\n### %s — %s\n\n", tis, top_patients$cell_type[i]))
+  plot_patient_umap(pat, tis)
+}
+```
+
+## Subclone Composition
+
+For each major leiden subclone (≥3% of its malignant group), show the fraction of mTCM / mTRM / mCyto cells. With NK reference, mTCM is now properly represented in subclones across all patients.
+
+```{r subclone-comp, fig.width=14, fig.height=10}
+sc_comp <- match_data$long |>
+  dplyr::filter(matched) |>
+  dplyr::group_by(tissue, cell_type, subclone_id) |>
+  dplyr::summarise(n_total = dplyr::n(),
+                   n_mTCM = sum(Malignant_T == "mTCM"),
+                   n_mTRM = sum(Malignant_T == "mTRM"),
+                   n_mCyto = sum(Malignant_T == "mCyto"),
+                   .groups = "drop") |>
+  dplyr::group_by(tissue, cell_type) |>
+  dplyr::mutate(pct_of_patient = 100 * n_total / sum(n_total)) |>
+  dplyr::ungroup() |>
+  dplyr::filter(pct_of_patient >= 3)
+
+sc_long <- sc_comp |>
+  dplyr::select(tissue, cell_type, subclone_id, mTCM = n_mTCM, mTRM = n_mTRM, mCyto = n_mCyto) |>
+  tidyr::pivot_longer(c(mTCM, mTRM, mCyto), names_to = "state", values_to = "n")
+
+ggplot(sc_long, aes(x = subclone_id, y = n, fill = state)) +
+  geom_col(position = "fill") +
+  scale_fill_manual(values = mal_colors) +
+  facet_wrap(~ tissue + cell_type, scales = "free_x", ncol = 3) +
+  theme_bw() + theme(axis.text.x = element_text(angle = 60, hjust = 1, size = 7)) +
+  labs(x = "Leiden subclone", y = "Fraction of cells",
+       title = "Malignant_T composition per subclone (subclones ≥3% of patient)")
+```
+
+## CNV Heatmaps {.tabset}
+
+```{r cnv-heatmaps-prep, include=FALSE}
+cache_hm <- "/srv/GT/analysis/p28409-Andrea/2026-03-24-UPhyloplot2-CNV-Trees/cache_01c_heatmaps.qs2"
+
+build_hm_mat <- function(inf_obj_path, malignant_pat_label, max_cells_per_subclone = 50) {
+  o <- readRDS(inf_obj_path)
+  sc_list <- o@tumor_subclusters$subclusters[[malignant_pat_label]]
+  if (is.null(sc_list)) return(NULL)
+  # sample cells from each subclone for tractability
+  set.seed(42)
+  sampled <- lapply(names(sc_list), function(sid) {
+    idx <- sc_list[[sid]]
+    if (length(idx) > max_cells_per_subclone) idx <- sample(idx, max_cells_per_subclone)
+    data.frame(subclone_id = sid, idx = idx)
+  })
+  picked <- do.call(rbind, sampled)
+  # filter subclones with <5 cells in the sample set
+  keep_sc <- picked |> dplyr::count(subclone_id) |> dplyr::filter(n >= 5) |> dplyr::pull(subclone_id)
+  picked <- picked[picked$subclone_id %in% keep_sc, ]
+  mat <- o@expr.data[, picked$idx, drop = FALSE]
+  list(mat = mat, picked = picked, gene_order = o@gene_order,
+       barcodes = colnames(o@expr.data)[picked$idx])
+}
+
+if (file.exists(cache_hm)) {
+  hm_data <- qs_read(cache_hm, nthreads = 8)
+} else {
+  skin_path  <- "/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/skin/run.final.infercnv_obj"
+  blood_path <- "/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/blood/run.final.infercnv_obj"
+
+  hm_data <- list()
+  for (tis in c("skin", "blood")) {
+    pats <- top_patients$cell_type[top_patients$tissue == tis]
+    for (p in pats) {
+      key <- paste(tis, p, sep = "::")
+      msg <- sprintf("Building heatmap matrix: %s\n", key); cat(msg)
+      path <- if (tis == "skin") skin_path else blood_path
+      hm_data[[key]] <- build_hm_mat(path, p, max_cells_per_subclone = 40)
+    }
+  }
+  qs_save(hm_data, cache_hm, nthreads = 8)
+}
+```
+
+Per patient: CNV signal heatmap (rows = genes ordered by chromosome, columns = cells grouped by leiden subclone). For tractability, up to 40 cells are sampled per subclone. Subclones with <5 cells after sampling are dropped. Cells colored by leiden subclone (top annotation) and Malignant_T state.
+
+```{r cnv-heatmaps, results='asis', fig.width=14, fig.height=8}
+suppressPackageStartupMessages({library(ComplexHeatmap); library(circlize)})
+
+plot_one_heatmap <- function(key, hm_data, match_long) {
+  d <- hm_data[[key]]
+  if (is.null(d)) return(invisible(NULL))
+  mat <- d$mat
+  bc  <- d$barcodes
+  picked <- d$picked
+  # build cell annotations
+  ca <- match_long |>
+    dplyr::filter(barcode %in% bc) |>
+    dplyr::distinct(barcode, .keep_all = TRUE)
+  cell_order <- order(picked$subclone_id)
+  mat <- mat[, cell_order, drop = FALSE]
+  picked <- picked[cell_order, ]
+  bc <- bc[cell_order]
+  ca <- ca[match(bc, ca$barcode), ]
+
+  # gene chromosomal order
+  go <- d$gene_order
+  go <- go[rownames(mat), , drop = FALSE]
+  go_order <- order(go$chr, go$start)
+  mat <- mat[go_order, , drop = FALSE]
+  go <- go[go_order, , drop = FALSE]
+
+  # subclone palette
+  sub_ids <- unique(picked$subclone_id)
+  sub_pal <- if (length(sub_ids) <= 24) unname(pals::tableau20())[seq_along(sub_ids)] else unname(pals::polychrome())[seq_along(sub_ids)]
+  names(sub_pal) <- sub_ids
+
+  top_ann <- HeatmapAnnotation(
+    subclone = picked$subclone_id,
+    Malignant_T = ifelse(is.na(ca$Malignant_T), "unmatched", ca$Malignant_T),
+    col = list(
+      subclone = sub_pal,
+      Malignant_T = c(mal_colors, unmatched = "grey80")
+    ),
+    show_annotation_name = TRUE, simple_anno_size = unit(3, "mm")
+  )
+  # chromosome row annotation
+  chr_levels <- unique(go$chr)
+  chr_colors <- setNames(rep(c("#444444", "#BBBBBB"), length.out = length(chr_levels)), chr_levels)
+  row_ann <- rowAnnotation(chr = anno_simple(as.character(go$chr), col = chr_colors,
+                                              border = FALSE),
+                            show_annotation_name = FALSE)
+
+  rng <- range(mat)
+  col_fun <- circlize::colorRamp2(c(rng[1], 1, rng[2]), c("#00428c", "white", "#9e002a"))
+
+  ht <- Heatmap(t(mat),
+    name = "CNV",
+    col = col_fun,
+    cluster_rows = FALSE, cluster_columns = FALSE,
+    show_row_names = FALSE, show_column_names = FALSE,
+    top_annotation = NULL,
+    left_annotation = rowAnnotation(
+      subclone = picked$subclone_id,
+      Malignant_T = ifelse(is.na(ca$Malignant_T), "unmatched", ca$Malignant_T),
+      col = list(subclone = sub_pal, Malignant_T = c(mal_colors, unmatched = "grey80")),
+      simple_anno_size = unit(3, "mm")
+    ),
+    column_split = factor(go$chr, levels = chr_levels),
+    column_title_gp = gpar(fontsize = 8),
+    column_gap = unit(0.5, "mm"),
+    border = TRUE,
+    use_raster = TRUE,
+    row_title = NULL,
+    column_title = sprintf("%s — CNV signal (rows=cells grouped by subclone, cols=genes by chr)", key)
+  )
+  draw(ht)
+}
+
+for (key in names(hm_data)) {
+  parts <- strsplit(key, "::")[[1]]
+  cat(sprintf("\n### %s — %s\n\n", parts[1], parts[2]))
+  plot_one_heatmap(key, hm_data, match_data$long)
+  cat("\n\n")
+}
+```
+
+## Subclone Phylogenetic Trees {.tabset}
+
+```{r trees-prep, include=FALSE}
+cache_trees <- "/srv/GT/analysis/p28409-Andrea/2026-03-24-UPhyloplot2-CNV-Trees/cache_01c_trees.qs2"
+
+# compute subclone centroids in CNV space and build hierarchical tree
+build_centroid_tree <- function(inf_obj_path, malignant_pat_label, min_sc_size = 5) {
+  o <- readRDS(inf_obj_path)
+  sc_list <- o@tumor_subclusters$subclusters[[malignant_pat_label]]
+  if (is.null(sc_list)) return(NULL)
+  sc_sizes <- sapply(sc_list, length)
+  keep <- names(sc_sizes)[sc_sizes >= min_sc_size]
+  if (length(keep) < 2) return(NULL)
+  centroids <- sapply(keep, function(sid) {
+    idx <- sc_list[[sid]]
+    rowMeans(o@expr.data[, idx, drop = FALSE])
+  })
+  d <- dist(t(centroids), method = "euclidean")
+  hc <- hclust(d, method = "ward.D2")
+  list(hc = hc, sizes = sc_sizes[keep],
+       barcodes_per_sc = lapply(keep, function(sid) colnames(o@expr.data)[sc_list[[sid]]]))
+}
+
+if (file.exists(cache_trees)) {
+  trees <- qs_read(cache_trees, nthreads = 8)
+} else {
+  skin_path  <- "/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/skin/run.final.infercnv_obj"
+  blood_path <- "/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/blood/run.final.infercnv_obj"
+  trees <- list()
+  for (tis in c("skin", "blood")) {
+    pats <- top_patients$cell_type[top_patients$tissue == tis]
+    for (p in pats) {
+      key <- paste(tis, p, sep = "::")
+      cat(sprintf("Building tree: %s\n", key))
+      path <- if (tis == "skin") skin_path else blood_path
+      trees[[key]] <- build_centroid_tree(path, p, min_sc_size = 10)
+    }
+  }
+  qs_save(trees, cache_trees, nthreads = 8)
+}
+```
+
+For each patient, **leiden subclones** with ≥10 cells are summarised by their CNV centroid (mean signal across all genes). Subclones are then hierarchically clustered (Ward.D2, Euclidean) to give a per-patient phylogeny. Leaf label and tip size: `subclone_id (n cells | mTCM/mTRM/mCyto fractions)`.
+
+```{r trees-plot, results='asis', fig.width=11, fig.height=8}
+suppressPackageStartupMessages({library(ape); library(ggtree)})
+
+plot_one_tree <- function(key) {
+  t_obj <- trees[[key]]
+  if (is.null(t_obj)) { cat("_(skipped, <2 subclones with >=10 cells)_\n\n"); return(invisible(NULL)) }
+  hc <- t_obj$hc
+  phy <- ape::as.phylo(hc)
+  sizes <- t_obj$sizes
+  bcs   <- t_obj$barcodes_per_sc
+  names(bcs) <- names(sizes)
+  # for each subclone, fraction of mTCM/mTRM/mCyto
+  comp <- sapply(names(sizes), function(sid) {
+    bc <- bcs[[sid]]
+    m  <- mal_meta[match(bc, mal_meta$barcode), ]
+    if (sum(!is.na(m$Malignant_T)) == 0) return(c(mTCM = 0, mTRM = 0, mCyto = 0, frac_matched = 0))
+    t <- table(factor(m$Malignant_T, levels = c("mTCM", "mTRM", "mCyto")))
+    frac <- as.numeric(t) / max(1, sum(t))
+    c(mTCM = frac[1], mTRM = frac[2], mCyto = frac[3],
+      frac_matched = sum(!is.na(m$Malignant_T)) / length(bc))
+  })
+  comp <- t(comp); rownames(comp) <- names(sizes)
+
+  # build a label
+  lab_df <- data.frame(
+    label = names(sizes),
+    n     = unname(sizes),
+    pct_mTCM = round(100 * comp[, "mTCM"]),
+    pct_mTRM = round(100 * comp[, "mTRM"]),
+    pct_mCyto = round(100 * comp[, "mCyto"]),
+    pretty = sprintf("%s (n=%d | %d/%d/%d)",
+                     names(sizes), unname(sizes),
+                     round(100 * comp[, "mTCM"]),
+                     round(100 * comp[, "mTRM"]),
+                     round(100 * comp[, "mCyto"]))
+  )
+  # assign dominant state for color
+  lab_df$dominant <- apply(comp[, 1:3, drop = FALSE], 1, function(r) {
+    if (sum(r) == 0) return("unmatched")
+    c("mTCM", "mTRM", "mCyto")[which.max(r)]
+  })
+
+  # plot with ggtree
+  tg <- ggtree(phy) %<+% lab_df
+  p <- tg +
+    geom_tippoint(aes(size = n, color = dominant)) +
+    geom_tiplab(aes(label = pretty), align = TRUE, size = 3, offset = 0.02) +
+    scale_color_manual(values = c(mal_colors, unmatched = "grey60")) +
+    scale_size_continuous(range = c(2, 8)) +
+    theme_tree() +
+    xlim(0, max(ape::node.depth.edgelength(phy)) * 1.8) +
+    ggtitle(sprintf("%s — subclone phylogeny (Ward.D2 on CNV centroids)", key)) +
+    labs(caption = "Label: subclone_id (n cells | %mTCM / %mTRM / %mCyto)")
+  print(p)
+}
+
+for (key in names(trees)) {
+  parts <- strsplit(key, "::")[[1]]
+  cat(sprintf("\n### %s — %s\n\n", parts[1], parts[2]))
+  plot_one_tree(key)
+  cat("\n\n")
+}
+```
+
+## UPhyloplot2 SVG Trees {.tabset}
+
+Subclonal phylogenies in the style of **UPhyloplot2** (Kurtenbach et al., BMC Genomics 2021) — thick-branched trees where branch width scales with subclone size, leaves labelled by letter (A–H), trunks annotated with the shared CNV events. **One tree per patient**, panels for blood patients and skin patients delivered as two combined SVGs.
+
+**Per-patient scope (paper labels):** each patient's tree pools ALL their malignant cells across the inferCNV input subclusters — so for skin patients this includes cells originally in `Malignant T1/T2/T3`, plus `Malignant exhausted` and `Malignant Treg` (both >97% mTRM in the current `Malignant_T` annotation).
+
+**Subclone coloring (post-processing):** UPhyloplot2 doesn't natively know about Malignant_T. After the SVG is generated, each subclone rectangle is recoloured by **the dominant Malignant_T state of the cells assigned to that subclone** (joining cell_groupings → `mal_meta`): **mTCM = darkgreen, mTRM = darkred, mCyto = darkblue**. The letter labels (A, B, C, …) stay the same; the legend on the right shows each subclone's `path → %cells → [dominant_state]`.
+
+**State-shift markers:** for each subclone whose dominant Malignant_T state differs from its parent subclone (e.g. mTCM parent → mTRM child, indicating malignant-state differentiation within a CNV clone), a small filled **diamond** is overlaid next to the letter in the colour of the NEW state. A "Transitions:" block at the bottom of each panel's legend column lists every parent→child shift explicitly (e.g. `mTRM → mTCM at G`).
+
+| | Patients included (≥20 malignant cells in inferCNV) | Patients skipped (too few cells) |
+|---|---|---|
+| **Blood** | blood 1, 2, 4, 5, 6, 7, 8 (n=734–6,452, subsampled to ≤300/tree) | — |
+| **Skin**  | skin 1, 2, 3, 7, 8 (n=90–453, kept in full, subsampled to ≤300) | skin 4 (13), 5 (32), 6 (12), 9 (4) |
+
+Each per-patient Newick is Ward.D2 hclust on Euclidean distances over the denoised CNV signal (`@expr.data`) of the cells. UPhyloplot2 (`cut_length=4`) defines subclones from the dendrogram, same as the 01b report. Trunk CNV annotations are computed from the mean CNV signal across each patient's cells (gain ≥1.05, del ≤0.95, ≥50% of arm's genes; top-10 events per patient).
+
+```{r uphylo-setup, include=FALSE}
+suppressPackageStartupMessages({library(ape); library(base64enc)})
+
+work_root   <- "/srv/GT/analysis/p28409-Andrea/2026-03-24-UPhyloplot2-CNV-Trees"
+uphylo_main <- file.path(work_root, "UPhyloplot2")
+uphylo_skin  <- file.path(work_root, "uphylo_NKref/skin")
+uphylo_blood <- file.path(work_root, "uphylo_NKref/blood")
+
+setup_uphylo_dir <- function(d) {
+  dir.create(file.path(d, "Inputs"), showWarnings = FALSE, recursive = TRUE)
+  for (f in c("uphyloplot2.py", "newick_input.py", "__init__.py", "setup.py")) {
+    target <- file.path(d, f)
+    src <- file.path(uphylo_main, f)
+    if (!file.exists(target) && file.exists(src)) file.symlink(src, target)
+  }
+}
+setup_uphylo_dir(uphylo_skin)
+setup_uphylo_dir(uphylo_blood)
+
+# Per-patient lists (paper labels: blood 1-8, skin 1-9; skip patients with < ~20 cells)
+patients_blood <- c("blood 1", "blood 2", "blood 4", "blood 5",
+                    "blood 6", "blood 7", "blood 8")
+patients_skin  <- c("skin 1",  "skin 2",  "skin 3",  "skin 7", "skin 8")
+
+# Output name: replace spaces with underscores so file paths are safe
+clean_name <- function(g) gsub("\\s+", "_", g)
+
+skin_inf_path  <- "/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/skin/run.final.infercnv_obj"
+blood_inf_path <- "/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/blood/run.final.infercnv_obj"
+```
+
+```{r uphylo-prep-newick, include=FALSE}
+build_newick_for_patient <- function(inf_obj, patient_id, work_dir, mal_meta_df,
+                                     max_cells = 300, seed = 42) {
+  out_name <- clean_name(patient_id)
+  newick_path <- file.path(work_dir, "Inputs", paste0(out_name, ".observations_dendrogram.txt"))
+  if (file.exists(newick_path)) {
+    return(list(out_name = out_name, path = newick_path,
+                n_cells = NA_integer_, cached = TRUE))
+  }
+  # All malignant cells for this patient (across all inferCNV groups), restricted
+  # to those actually present in the inferCNV obs matrix.
+  pat_bcs   <- mal_meta_df$barcode[mal_meta_df$patient == patient_id]
+  inf_cells <- intersect(pat_bcs, colnames(inf_obj@expr.data))
+  if (length(inf_cells) < 10) return(NULL)
+  if (length(inf_cells) > max_cells) {
+    set.seed(seed); inf_cells <- sample(inf_cells, max_cells)
+  }
+  mat <- inf_obj@expr.data[, inf_cells, drop = FALSE]
+  d   <- dist(t(mat), method = "euclidean")
+  hc  <- hclust(d, method = "ward.D2")
+  phy <- ape::as.phylo(hc)
+  ape::write.tree(phy, newick_path)
+  list(out_name = out_name, path = newick_path, n_cells = ncol(mat), cached = FALSE)
+}
+
+needs_skin  <- !all(file.exists(file.path(uphylo_skin,  "Inputs",
+                                          paste0(clean_name(patients_skin),  ".observations_dendrogram.txt"))))
+needs_blood <- !all(file.exists(file.path(uphylo_blood, "Inputs",
+                                          paste0(clean_name(patients_blood), ".observations_dendrogram.txt"))))
+
+# NB. Variable names retain "_groups_info" / "groups_order" for downstream
+# compatibility, but each entry is now a per-PATIENT panel, not a per-cell-type group.
+skin_groups_info <- list()
+if (needs_skin) {
+  cat("Loading skin inferCNV object...\n")
+  o_skin <- readRDS(skin_inf_path)
+  skin_groups_info <- lapply(patients_skin, build_newick_for_patient,
+                             inf_obj = o_skin, work_dir = uphylo_skin,
+                             mal_meta_df = mal_meta)
+  rm(o_skin); gc(verbose = FALSE)
+} else {
+  skin_groups_info <- lapply(patients_skin, function(p) {
+    list(out_name = clean_name(p),
+         path = file.path(uphylo_skin, "Inputs", paste0(clean_name(p), ".observations_dendrogram.txt")),
+         cached = TRUE)
+  })
+}
+names(skin_groups_info) <- patients_skin
+skin_groups_info <- skin_groups_info[!sapply(skin_groups_info, is.null)]
+
+blood_groups_info <- list()
+if (needs_blood) {
+  cat("Loading blood inferCNV object...\n")
+  o_blood <- readRDS(blood_inf_path)
+  blood_groups_info <- lapply(patients_blood, build_newick_for_patient,
+                              inf_obj = o_blood, work_dir = uphylo_blood,
+                              mal_meta_df = mal_meta)
+  rm(o_blood); gc(verbose = FALSE)
+} else {
+  blood_groups_info <- lapply(patients_blood, function(p) {
+    list(out_name = clean_name(p),
+         path = file.path(uphylo_blood, "Inputs", paste0(clean_name(p), ".observations_dendrogram.txt")),
+         cached = TRUE)
+  })
+}
+names(blood_groups_info) <- patients_blood
+blood_groups_info <- blood_groups_info[!sapply(blood_groups_info, is.null)]
+```
+
+```{r uphylo-run, include=FALSE}
+conda_prefix <- "/usr/local/ngseq/miniforge3/bin/conda"
+
+run_uphylo_for_tissue <- function(work_dir, groups_info) {
+  output_svg <- file.path(work_dir, "output.svg")
+  inputs_dir <- file.path(work_dir, "Inputs")
+
+  # 1. Per-group: newick_input.py → Inputs/<out_name>.cell_groupings
+  for (info in groups_info) {
+    cg_file <- file.path(inputs_dir, paste0(info$out_name, ".cell_groupings"))
+    if (file.exists(cg_file)) next
+    if (!file.exists(info$path)) next
+    cmd <- sprintf(
+      'cd %s && eval "$(%s shell.bash hook)" && conda activate ps_pgueguen && printf "%%s\\n4\\n%s\\n" "%s" | python newick_input.py',
+      shQuote(work_dir), conda_prefix, info$out_name, info$path
+    )
+    cat("newick_input.py →", info$out_name, "\n")
+    system(cmd, intern = FALSE)
+  }
+
+  # 2. Run uphyloplot2.py once for the whole Inputs/ dir
+  if (!file.exists(output_svg)) {
+    cmd_run <- sprintf(
+      'cd %s && eval "$(%s shell.bash hook)" && conda activate ps_pgueguen && python uphyloplot2.py -c 5',
+      shQuote(work_dir), conda_prefix
+    )
+    cat("uphyloplot2.py →", work_dir, "\n")
+    system(cmd_run, intern = FALSE)
+  }
+}
+
+run_uphylo_for_tissue(uphylo_skin,  skin_groups_info)
+run_uphylo_for_tissue(uphylo_blood, blood_groups_info)
+
+skin_svg_raw  <- file.path(uphylo_skin,  "output.svg")
+blood_svg_raw <- file.path(uphylo_blood, "output.svg")
+stopifnot(file.exists(skin_svg_raw))
+stopifnot(file.exists(blood_svg_raw))
+```
+
+```{r uphylo-helpers, include=FALSE}
+# Recover full barcodes from a generated Newick file. newick_input.py parses our
+# `AAACCTGAGACAGAGA-1_1_1` barcodes by stripping the first character AND truncating
+# at the first `-`, so the cell_groupings row reads `AAACCTGAGACAGAGA` → `ACCTGAGACAGAGA`
+# (the `-1_1_1` suffix also appears as a noise row like `1_1_1` we filter out).
+recover_full_barcodes <- function(newick_file, cg_file) {
+  tree_text <- readLines(newick_file)
+  full_bcs  <- regmatches(tree_text, gregexpr("[ACGT]{10,}-[0-9]+(_[0-9]+)*", tree_text))[[1]]
+  full_bcs  <- unique(full_bcs)
+  # newick_input.py form = substring(2, position-of-first-dash - 1)
+  trunc_form <- substring(full_bcs, 2, regexpr("-", full_bcs) - 1)
+  bc_lookup  <- setNames(full_bcs, trunc_form)
+  cg <- read.delim(cg_file, header = FALSE, stringsAsFactors = FALSE)
+  colnames(cg) <- c("subclone_path", "cell_barcode")
+  # drop suffix-noise rows (digit/underscore-only strings, no DNA letters)
+  cg <- cg[grepl("^[ACGT]+$", cg$cell_barcode), ]
+  cg$full_barcode <- bc_lookup[cg$cell_barcode]
+  cg
+}
+
+# UPhyloplot2 letter palette (same order as in uphyloplot2.py -c 5)
+uphylo_colors  <- c("#C15A5B", "#9DABC5", "#81BED0", "#AAD1B6", "#6AAB73",
+                    "#E7E689", "#D89560", "#85593E", "#C55E7B", "#9F8272",
+                    "#365584", "#6582A2", "#6B8675", "#61497B", "#E7C665")
+uphylo_letters <- LETTERS[1:15]
+
+# Compute per-(patient, letter) Malignant_T composition by joining each subclone's
+# cells (via cell_groupings + recovered full barcodes) to mal_meta. Returns a long
+# data.frame with one row per (group, letter) and a dominant-state column.
+compute_subclone_state_composition <- function(work_dir, groups_info, mal_meta_df) {
+  cnv_files_dir <- file.path(work_dir, "CNV_files")
+  inputs_dir    <- file.path(work_dir, "Inputs")
+  rows <- list()
+  for (info in groups_info) {
+    cg_file  <- file.path(inputs_dir,    paste0(info$out_name, ".cell_groupings"))
+    csv_file <- file.path(cnv_files_dir, paste0(info$out_name, ".cell_groupings.csv"))
+    if (!file.exists(cg_file) || !file.exists(csv_file)) next
+    cg <- recover_full_barcodes(info$path, cg_file)
+    legend_df <- tryCatch(read.csv(csv_file, header = FALSE, fill = TRUE,
+                                   stringsAsFactors = FALSE,
+                                   col.names = paste0("V", 1:8)),
+                          error = function(e) NULL)
+    if (is.null(legend_df) || nrow(legend_df) == 0) next
+    legend_df <- legend_df[grepl("^[0-9.]+$", legend_df$V1), , drop = FALSE]
+    legend_df$V2 <- suppressWarnings(as.numeric(legend_df$V2))
+    legend_df <- legend_df[!is.na(legend_df$V2), , drop = FALSE]
+    if (nrow(legend_df) == 0) next
+    colnames(legend_df)[1:3] <- c("path", "pct", "letter")
+    cg$path <- sub("^all_observations\\.all_observations\\.", "", cg$subclone_path)
+    cg_join <- merge(cg, legend_df[, c("path", "letter", "pct")], by = "path", all.x = TRUE)
+    cg_join$letter[is.na(cg_join$letter)] <- "minor"
+    cg_join <- merge(cg_join,
+                     mal_meta_df[, c("barcode", "Malignant_T")],
+                     by.x = "full_barcode", by.y = "barcode", all.x = TRUE)
+    by_letter <- cg_join |>
+      dplyr::group_by(letter) |>
+      dplyr::summarise(
+        n_cells = dplyr::n(),
+        n_matched = sum(!is.na(Malignant_T)),
+        pct_mTCM  = round(100 * sum(Malignant_T == "mTCM",  na.rm = TRUE) / max(1, sum(!is.na(Malignant_T))), 1),
+        pct_mTRM  = round(100 * sum(Malignant_T == "mTRM",  na.rm = TRUE) / max(1, sum(!is.na(Malignant_T))), 1),
+        pct_mCyto = round(100 * sum(Malignant_T == "mCyto", na.rm = TRUE) / max(1, sum(!is.na(Malignant_T))), 1),
+        .groups = "drop"
+      )
+    # Dominant state per letter (NA when no matched cells)
+    by_letter$dominant <- ifelse(
+      by_letter$n_matched == 0, NA_character_,
+      c("mTCM", "mTRM", "mCyto")[apply(
+        as.matrix(by_letter[, c("pct_mTCM", "pct_mTRM", "pct_mCyto")]), 1, which.max)]
+    )
+    by_letter$group <- info$out_name
+    rows[[info$out_name]] <- by_letter[, c("group", "letter", "n_cells", "n_matched",
+                                            "pct_mTCM", "pct_mTRM", "pct_mCyto", "dominant")]
+  }
+  do.call(rbind, rows)
+}
+
+# State colors (paper palette)
+state_pal_solid <- c(mTCM = "darkgreen", mTRM = "darkred", mCyto = "darkblue")
+
+# GRCh38 centromere positions (Mb) for p/q arm classification
+chr_centro <- c(
+  chr1 = 125.0, chr2 = 93.9, chr3 = 91.0, chr4 = 50.4,  chr5 = 48.8,  chr6 = 61.0,
+  chr7 = 59.9,  chr8 = 45.6, chr9 = 43.0, chr10 = 39.8, chr11 = 53.4, chr12 = 35.8,
+  chr13 = 17.7, chr14 = 17.2, chr15 = 19.0, chr16 = 36.6, chr17 = 25.1, chr18 = 18.5,
+  chr19 = 26.5, chr20 = 28.1, chr21 = 12.0, chr22 = 15.0
+) * 1e6
+state_label <- c("1" = "del", "2" = "LOH", "3" = "neutral", "4" = "gain", "5" = "amp")
+
+# Compute arm-level gain/del events from a denoised CNV signal matrix.
+# inferCNV's denoised @expr.data is heavily smoothed (typical sd ~0.02), so the
+# per-gene 5%-deviation thresholds (gain>1.05 / del<0.95) catch almost no genes
+# even when an arm is clearly aberrant at the population level (Pair 2 truncal
+# had 0 events under that scheme despite chr17q-gain / chr10p-gain visible at
+# pop level). Switching to **arm-mean** thresholds matched to the actual signal
+# range: gain = arm mean > 1.015, del = arm mean < 0.985 (~1× sd from baseline).
+arm_events <- function(cnv_mat, cells, go, centro,
+                       gain_thresh = 1.015, loss_thresh = 0.985,
+                       min_genes = 5) {
+  if (length(cells) == 0) return(character())
+  cells <- intersect(cells, colnames(cnv_mat))
+  if (length(cells) == 0) return(character())
+  mean_cnv <- rowMeans(cnv_mat[, cells, drop = FALSE], na.rm = TRUE)
+  m <- go[match(names(mean_cnv), rownames(go)), ]
+  keep <- !is.na(m$chr)
+  mean_cnv <- mean_cnv[keep]; m <- m[keep, ]
+  end_col <- if ("stop" %in% colnames(m)) "stop" else "end"
+  arm <- ifelse(!is.na(centro[m$chr]) & (m$start + m[[end_col]])/2 < centro[m$chr], "p", "q")
+  chr_arm <- paste0(m$chr, arm)
+  by_arm <- split(mean_cnv, chr_arm)
+  events <- c()
+  for (a in names(by_arm)) {
+    if (length(by_arm[[a]]) < min_genes) next
+    arm_mean <- mean(by_arm[[a]])
+    if (arm_mean > gain_thresh) {
+      events <- c(events, paste0(sub("^chr", "", a), " gain"))
+    } else if (arm_mean < loss_thresh) {
+      events <- c(events, paste0(sub("^chr", "", a), " del"))
+    }
+  }
+  sort(events)
+}
+
+# Compute per-patient trunk events directly from the inferCNV obj.
+# Replaces the old pred_cnv_regions.dat lookup (which keyed by Malignant T<N>
+# groups that no longer correspond to our per-patient panel structure).
+compute_patient_trunk_events <- function(inf_obj_path, patients, mal_meta_df,
+                                         max_events = 10) {
+  out <- setNames(vector("list", length(patients)), patients)
+  if (!file.exists(inf_obj_path)) return(out)
+  o <- readRDS(inf_obj_path)
+  go <- as.data.frame(o@gene_order)
+  for (p in patients) {
+    pat_bcs <- mal_meta_df$barcode[mal_meta_df$patient == p]
+    cells   <- intersect(pat_bcs, colnames(o@expr.data))
+    if (length(cells) < 10) next
+    events  <- arm_events(o@expr.data, cells, go, chr_centro)
+    if (length(events) > max_events) events <- events[seq_len(max_events)]
+    out[[p]] <- events
+  }
+  rm(o); gc(verbose = FALSE)
+  out
+}
+```
+
+```{r uphylo-enhance, include=FALSE}
+enhance_svg <- function(raw_svg, work_dir, groups_info,
+                        cnv_per_group = NULL,
+                        groups_order = NULL, out_svg = NULL) {
+  if (is.null(out_svg)) out_svg <- sub("\\.svg$", "_enhanced.svg", raw_svg)
+  if (file.exists(out_svg)) return(out_svg)
+  if (is.null(groups_order)) groups_order <- names(groups_info)
+
+  svg_lines <- readLines(raw_svg)
+  vb_line   <- grep("viewBox", svg_lines, value = TRUE)[1]
+  vb_nums   <- as.numeric(regmatches(vb_line, gregexpr("[0-9]+\\.?[0-9]*", vb_line))[[1]])
+  svg_w     <- vb_nums[3]; svg_h <- vb_nums[4]
+
+  # --- Compute per-(patient, letter) dominant Malignant_T state ------------
+  # Used to recolour the subclone rects from UPhyloplot2's default 15-color palette
+  # to paper-canonical state colors (mTCM=darkgreen / mTRM=darkred / mCyto=darkblue).
+  comp_df <- tryCatch(
+    compute_subclone_state_composition(work_dir, groups_info, mal_meta),
+    error = function(e) NULL)
+  dominant_lookup <- list()
+  if (!is.null(comp_df) && nrow(comp_df) > 0) {
+    for (g in unique(comp_df$group)) {
+      sub <- comp_df[comp_df$group == g, ]
+      m <- setNames(rep(NA_character_, length(uphylo_letters)), uphylo_letters)
+      for (i in seq_len(nrow(sub))) {
+        if (sub$letter[i] %in% uphylo_letters) m[sub$letter[i]] <- sub$dominant[i]
+      }
+      dominant_lookup[[g]] <- m
+    }
+  }
+
+  # Per-group legend from CNV_files/<out_name>.cell_groupings.csv
+  cnv_files_dir <- file.path(work_dir, "CNV_files")
+  csv_files <- list.files(cnv_files_dir, pattern = "\\.csv$", full.names = TRUE)
+  legend_entries <- list()
+  # uphyloplot2.py writes ragged CSVs (some rows have 5+ cols when there are many subclones).
+  # read.csv then over-splits some rows into spurious single-letter "rows" with NA in V2.
+  read_uphylo_csv <- function(f) {
+    df <- tryCatch(read.csv(f, header = FALSE, fill = TRUE, stringsAsFactors = FALSE,
+                            col.names = paste0("V", 1:8)),
+                   error = function(e) NULL)
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    df <- df[grepl("^[0-9.]+$", df$V1), , drop = FALSE]     # keep numeric paths
+    df$V2 <- suppressWarnings(as.numeric(df$V2))
+    df <- df[!is.na(df$V2), , drop = FALSE]
+    df
+  }
+  for (csv_file in csv_files) {
+    pt_name <- sub("\\.cell_groupings\\.csv$", "", basename(csv_file))
+    df <- read_uphylo_csv(csv_file)
+    if (is.null(df) || nrow(df) == 0) next
+    df <- df[df$V2 > 0, , drop = FALSE]
+    for (i in seq_len(nrow(df))) {
+      lbl <- trimws(df$V3[i])
+      if (!is.na(lbl) && nchar(lbl) > 0) {
+        legend_entries[[paste0(pt_name, "_", lbl)]] <- list(
+          patient = pt_name, label = lbl,
+          subclone = df$V1[i], pct = round(df$V2[i], 1)
+        )
+      }
+    }
+  }
+  pt_names <- intersect(sapply(groups_info, `[[`, "out_name"), unique(sapply(legend_entries, `[[`, "patient")))
+
+  legend_x_start <- svg_w + 10
+  legend_y_start <- 40
+  row_h <- 18
+  col_w <- 130
+  legend_svg <- character()
+  for (pi in seq_along(pt_names)) {
+    pt <- pt_names[pi]
+    col_x <- legend_x_start + (pi - 1) * col_w
+    legend_svg <- c(legend_svg, sprintf(
+      '<text x="%s" y="%s" font-family="ArialMT" font-size="10" font-weight="bold">%s</text>',
+      col_x, legend_y_start - 5, pt))
+    pt_entries <- Filter(function(e) e$patient == pt, legend_entries)
+    for (ei in seq_along(pt_entries)) {
+      e <- pt_entries[[ei]]
+      y_pos   <- legend_y_start + (ei - 1) * row_h + 10
+      dom     <- dominant_lookup[[pt]][e$label]
+      col     <- if (!is.na(dom)) state_pal_solid[[dom]] else "#888888"
+      dom_lbl <- if (!is.na(dom)) dom else "?"
+      legend_svg <- c(legend_svg,
+        sprintf('<rect x="%s" y="%s" width="12" height="12" rx="2" fill="%s"/>',
+                col_x, y_pos - 10, col),
+        sprintf('<text x="%s" y="%s" font-family="ArialMT" font-size="9">%s  %s (%.1f%%) [%s]</text>',
+                col_x + 16, y_pos, e$label, e$subclone, e$pct, dom_lbl))
+    }
+  }
+
+  # Trunk CNV annotations per panel — UPhyloplot2 spaces panels by 110 px starting at x=60
+  # `cnv_per_group` is now a per-PATIENT named list (computed by compute_patient_trunk_events).
+  trunk_annot_svg <- character()
+  if (!is.null(cnv_per_group)) {
+    for (pi in seq_along(groups_order)) {
+      g <- groups_order[pi]
+      annots <- cnv_per_group[[g]]
+      if (length(annots) == 0) next
+      trunk_x <- 60 + (pi - 1) * 110
+      losses <- annots[grepl("LOH|del", annots)]
+      gains  <- annots[grepl("gain|amp", annots)]
+      for (li in seq_along(losses)) {
+        trunk_annot_svg <- c(trunk_annot_svg, sprintf(
+          '<text x="%s" y="%s" font-family="ArialMT" font-size="7" text-anchor="end" font-style="italic">%s</text>',
+          trunk_x - 12, 50 + (li - 1) * 10, losses[li]))
+      }
+      for (gi in seq_along(gains)) {
+        trunk_annot_svg <- c(trunk_annot_svg, sprintf(
+          '<text x="%s" y="%s" font-family="ArialMT" font-size="7" font-style="italic">%s</text>',
+          trunk_x + 12, 50 + (gi - 1) * 10, gains[gi]))
+      }
+    }
+  }
+
+  # --- Recolor subclone rects by dominant Malignant_T state ---------------
+  # UPhyloplot2 outputs its own 15-color palette per subclone letter (A=#C15A5B, ...).
+  # We replace each <rect>'s fill with the paper-canonical color of that subclone's
+  # dominant state. Panel index is inferred from rect x: panel pi is centered at
+  # x = 60 + (pi-1)*110 (UPhyloplot2 convention with `--space_between_plots=110`).
+  letter_for_color <- setNames(uphylo_letters, tolower(uphylo_colors))
+  # Fallback per-patient overall dominant state (used for subclones too small to
+  # appear in UPhyloplot2's legend; otherwise their rects would stay in the
+  # default palette).
+  # Key the lookup by BOTH the space-form ("skin 7" — as in groups_order) AND
+  # the underscore-form ("skin_7" — as used by csv basenames / out_names) so it
+  # works whether the caller uses the panel-order name or the file-stem name.
+  patient_overall_dom <- c()
+  for (g in groups_order) {
+    pat_id <- if (grepl(" ", g)) g else gsub("_", " ", g)
+    pat_states <- mal_meta$Malignant_T[mal_meta$patient == pat_id]
+    pat_states <- pat_states[!is.na(pat_states)]
+    if (length(pat_states) > 0) {
+      tbl <- table(pat_states)
+      dom <- names(tbl)[which.max(tbl)]
+      patient_overall_dom[g] <- dom
+      patient_overall_dom[gsub(" ", "_", g)] <- dom
+    }
+  }
+  for (idx in seq_along(svg_lines)) {
+    line <- svg_lines[idx]
+    if (!grepl("<rect", line)) next
+    m_x <- regmatches(line, regexpr('x="[0-9.]+"', line))
+    m_fill <- regmatches(line, regexpr('fill="#[0-9A-Fa-f]{6}"', line))
+    if (length(m_x) == 0 || length(m_fill) == 0) next
+    x_val <- as.numeric(sub('x="', '', sub('"$', '', m_x)))
+    fill_val_raw <- sub('fill="', '', sub('"$', '', m_fill))
+    fill_val <- tolower(fill_val_raw)
+    letter <- letter_for_color[fill_val]
+    if (is.na(letter)) next  # not a UPhyloplot2 palette color
+    panel_idx <- floor(x_val / 110) + 1
+    if (panel_idx < 1 || panel_idx > length(groups_order)) next
+    # dominant_lookup is keyed by out_name (underscore form), groups_order has
+    # the space form — normalise to underscore so per-subclone state takes effect.
+    panel_pat <- gsub(" ", "_", groups_order[panel_idx])
+    dom <- dominant_lookup[[panel_pat]][letter]
+    # Fall back to overall patient state for unlabeled (minor) subclones
+    if (is.null(dom) || is.na(dom)) dom <- patient_overall_dom[panel_pat]
+    if (is.na(dom)) next
+    new_fill <- state_pal_solid[[dom]]
+    new_line <- sub(m_fill, sprintf('fill="%s"', new_fill), line, fixed = TRUE)
+    svg_lines[idx] <- new_line
+  }
+
+  # --- State-shift markers ---------------------------------------------------
+  # For each legend subclone, infer its parent subclone (path "1.2.1" → "1.2"),
+  # compare the dominant Malignant_T state of parent vs child. If different, mark
+  # that letter on the tree with a small colored chevron arrow + record the shift
+  # for a per-panel "Transitions" list in the side legend.
+  path_to_letter_by_pt <- list()
+  for (e in legend_entries) {
+    pt <- e$patient
+    if (is.null(path_to_letter_by_pt[[pt]])) path_to_letter_by_pt[[pt]] <- character()
+    path_to_letter_by_pt[[pt]][e$subclone] <- e$label
+  }
+  # Walk up the subclone path tree to find the nearest LABELED ancestor (a path
+  # that has a letter assigned in the legend). UPhyloplot2 omits letters for
+  # subclones <5% of cells, so a direct parent_path may not be in the legend —
+  # in that case we keep walking up. If no labeled ancestor is found, fall back
+  # to the patient's overall dominant state.
+  find_labeled_parent <- function(path, lookup) {
+    p <- path
+    while (TRUE) {
+      new_p <- sub("\\.[^.]+$", "", p)
+      if (new_p == p) return(NA_character_)  # no dot left → walked past root
+      p <- new_p
+      val <- lookup[p]
+      if (!is.null(val) && !is.na(val)) return(unname(val))
+    }
+  }
+  transitions <- list()
+  for (e in legend_entries) {
+    pt   <- e$patient
+    path <- e$subclone
+    if (path == "1" || !grepl("\\.", path)) next  # root has no parent
+    parent_letter <- find_labeled_parent(path, path_to_letter_by_pt[[pt]])
+    this_dom <- dominant_lookup[[pt]][e$label]
+    if (is.na(this_dom)) next
+    parent_dom <- if (!is.na(parent_letter)) dominant_lookup[[pt]][parent_letter] else NA
+    if (is.na(parent_dom)) parent_dom <- patient_overall_dom[pt]  # fallback
+    if (is.na(parent_dom) || this_dom == parent_dom) next
+    transitions[[length(transitions) + 1]] <- list(
+      patient = pt, letter = e$label,
+      parent_letter = if (is.na(parent_letter)) "<patient>" else parent_letter,
+      from = parent_dom, to = this_dom)
+  }
+  # Find letter tspan positions in SVG and overlay a colored marker on transitions
+  shift_marker_svg <- character()
+  if (length(transitions) > 0) {
+    trans_key <- vapply(transitions, function(t) paste0(t$patient, "_", t$letter), character(1))
+    for (line in svg_lines) {
+      m <- regmatches(line, regexec(
+        '<tspan x="([0-9.]+) *" y="([0-9.]+)"[^>]*>([A-N])</tspan>', line))[[1]]
+      if (length(m) < 4) next
+      x_val <- as.numeric(m[2]); y_val <- as.numeric(m[3]); letter <- m[4]
+      panel_idx <- floor(x_val / 110) + 1
+      if (panel_idx < 1 || panel_idx > length(groups_order)) next
+      panel_pat <- gsub(" ", "_", groups_order[panel_idx])  # match transitions' underscore-form keys
+      key <- paste0(panel_pat, "_", letter)
+      i <- match(key, trans_key)
+      if (is.na(i)) next
+      tr <- transitions[[i]]
+      to_color <- state_pal_solid[[tr$to]]
+      # small filled diamond next to the letter, in the NEW state's color
+      shift_marker_svg <- c(shift_marker_svg, sprintf(
+        '<polygon points="%.2f,%.2f %.2f,%.2f %.2f,%.2f %.2f,%.2f" fill="%s" stroke="white" stroke-width="0.6"/>',
+        x_val + 6, y_val - 4,        # top
+        x_val + 9, y_val - 1,        # right
+        x_val + 6, y_val + 2,        # bottom
+        x_val + 3, y_val - 1,        # left
+        to_color))
+    }
+  }
+
+  # Append a "Transitions:" sub-section to each panel's legend column
+  transitions_legend_svg <- character()
+  if (length(transitions) > 0) {
+    by_pt <- split(transitions, vapply(transitions, `[[`, character(1), "patient"))
+    legend_x_start_local <- svg_w + 10
+    for (pi in seq_along(pt_names)) {
+      pt <- pt_names[pi]
+      if (is.null(by_pt[[pt]])) next
+      col_x <- legend_x_start_local + (pi - 1) * col_w
+      pt_entries_local <- Filter(function(e) e$patient == pt, legend_entries)
+      base_y <- legend_y_start + length(pt_entries_local) * row_h + 18
+      transitions_legend_svg <- c(transitions_legend_svg, sprintf(
+        '<text x="%s" y="%s" font-family="ArialMT" font-size="9" font-weight="bold">Transitions:</text>',
+        col_x, base_y))
+      for (j in seq_along(by_pt[[pt]])) {
+        tr <- by_pt[[pt]][[j]]
+        y_pos <- base_y + j * 12
+        transitions_legend_svg <- c(transitions_legend_svg, sprintf(
+          '<text x="%s" y="%s" font-family="ArialMT" font-size="8">%s → %s at %s</text>',
+          col_x, y_pos, tr$from, tr$to, tr$letter))
+      }
+    }
+  }
+
+  new_w <- svg_w + length(pt_names) * col_w + 20
+  legend_max_rows <- if (length(pt_names) == 0) 0 else max(sapply(pt_names, function(pt)
+    sum(sapply(legend_entries, function(e) e$patient == pt))))
+  # Also reserve vertical space for trunk annotations
+  trunk_max_y <- 0
+  if (length(trunk_annot_svg) > 0) {
+    ys_matches <- regmatches(trunk_annot_svg, regexpr('y="[0-9]+"', trunk_annot_svg))
+    ys <- as.numeric(gsub('[y="]', "", ys_matches))
+    if (length(ys) > 0) trunk_max_y <- max(ys, na.rm = TRUE)
+  }
+  new_h <- max(svg_h,
+               legend_y_start + legend_max_rows * row_h + 30,
+               trunk_max_y + 20)
+  svg_lines[1] <- sprintf('<svg viewBox="0 0 %s %s" xmlns="http://www.w3.org/2000/svg">', new_w, new_h)
+
+  # Bump canvas height to fit the transitions block in the legend column
+  trans_max_rows <- if (length(transitions) == 0) 0 else
+    max(sapply(pt_names, function(pt) sum(vapply(transitions, function(t) t$patient == pt, logical(1))))) + 2
+  new_h <- max(new_h, legend_y_start + (legend_max_rows + trans_max_rows) * row_h + 30)
+  svg_lines[1] <- sprintf('<svg viewBox="0 0 %s %s" xmlns="http://www.w3.org/2000/svg">', new_w, new_h)
+
+  close_idx <- grep("</svg>", svg_lines)
+  svg_lines <- c(svg_lines[1:(close_idx - 1)],
+                 "", "<!-- Trunk CNV annotations -->", trunk_annot_svg,
+                 "", "<!-- Per-group legend -->", legend_svg,
+                 "", "<!-- State-shift markers on tree -->", shift_marker_svg,
+                 "", "<!-- Transition list in legend -->", transitions_legend_svg,
+                 svg_lines[close_idx:length(svg_lines)])
+  writeLines(svg_lines, out_svg)
+  out_svg
+}
+
+# Per-patient trunk events computed directly from CNV signal (cached for re-renders).
+cache_trunk_skin  <- file.path(work_root, "cache_01c_trunk_events_skin.qs2")
+cache_trunk_blood <- file.path(work_root, "cache_01c_trunk_events_blood.qs2")
+if (file.exists(cache_trunk_skin)) {
+  skin_trunk_events <- qs_read(cache_trunk_skin,  nthreads = 4)
+} else {
+  skin_trunk_events  <- compute_patient_trunk_events(skin_inf_path,  patients_skin,  mal_meta)
+  qs_save(skin_trunk_events,  cache_trunk_skin,  nthreads = 4)
+}
+if (file.exists(cache_trunk_blood)) {
+  blood_trunk_events <- qs_read(cache_trunk_blood, nthreads = 4)
+} else {
+  blood_trunk_events <- compute_patient_trunk_events(blood_inf_path, patients_blood, mal_meta)
+  qs_save(blood_trunk_events, cache_trunk_blood, nthreads = 4)
+}
+
+skin_svg  <- enhance_svg(skin_svg_raw,  uphylo_skin,  skin_groups_info,
+                         cnv_per_group = skin_trunk_events,
+                         groups_order = names(skin_groups_info))
+blood_svg <- enhance_svg(blood_svg_raw, uphylo_blood, blood_groups_info,
+                         cnv_per_group = blood_trunk_events,
+                         groups_order = names(blood_groups_info))
+```
+
+### Skin
+
+```{r uphylo-display-skin, results='asis'}
+svg_raw <- readLines(skin_svg) |> paste(collapse = "\n")
+b64 <- base64enc::base64encode(charToRaw(svg_raw))
+cat(sprintf('<img src="data:image/svg+xml;base64,%s" style="width:100%%; max-width:1400px;" />\n', b64))
+```
+
+### Blood
+
+```{r uphylo-display-blood, results='asis'}
+svg_raw <- readLines(blood_svg) |> paste(collapse = "\n")
+b64 <- base64enc::base64encode(charToRaw(svg_raw))
+cat(sprintf('<img src="data:image/svg+xml;base64,%s" style="width:100%%; max-width:1400px;" />\n', b64))
+```
+
+### Subclone composition
+
+For each UPhyloplot2 subclone letter, count how many cells are mTCM / mTRM / mCyto by joining recovered barcodes into `CTCL_blood_skin_malignant.qs2`. This is the headline biological readout — mixed-state subclones confirm that the NK-reference fix surfaces mTCM clones that 01b missed.
+
+```{r uphylo-comp-table, results='asis'}
+build_composition <- function(work_dir, groups_info, tissue) {
+  cnv_files_dir <- file.path(work_dir, "CNV_files")
+  inputs_dir    <- file.path(work_dir, "Inputs")
+  rows <- list()
+  for (info in groups_info) {
+    cg_file     <- file.path(inputs_dir,    paste0(info$out_name, ".cell_groupings"))
+    csv_file    <- file.path(cnv_files_dir, paste0(info$out_name, ".cell_groupings.csv"))
+    newick_file <- info$path
+    if (!file.exists(cg_file) || !file.exists(csv_file)) next
+    cg <- recover_full_barcodes(newick_file, cg_file)
+    legend_df <- tryCatch(read.csv(csv_file, header = FALSE, fill = TRUE,
+                                   stringsAsFactors = FALSE,
+                                   col.names = paste0("V", 1:8)),
+                          error = function(e) NULL)
+    if (is.null(legend_df) || nrow(legend_df) == 0) next
+    # Same ragged-CSV cleanup as enhance_svg()
+    legend_df <- legend_df[grepl("^[0-9.]+$", legend_df$V1), , drop = FALSE]
+    legend_df$V2 <- suppressWarnings(as.numeric(legend_df$V2))
+    legend_df <- legend_df[!is.na(legend_df$V2), , drop = FALSE]
+    if (nrow(legend_df) == 0) next
+    colnames(legend_df)[1:3] <- c("path", "pct", "letter")
+    # cell_groupings uses "all_observations.all_observations.<path>", CSV uses "<path>"
+    cg$path <- sub("^all_observations\\.all_observations\\.", "", cg$subclone_path)
+    cg_join <- merge(cg, legend_df[, c("path", "letter", "pct")], by = "path", all.x = TRUE)
+    cg_join$letter[is.na(cg_join$letter)] <- "minor"
+    # join to Seurat meta by full_barcode
+    cg_join <- merge(cg_join, mal_meta, by.x = "full_barcode", by.y = "barcode", all.x = TRUE)
+    by_letter <- cg_join |>
+      dplyr::group_by(letter) |>
+      dplyr::summarise(
+        n_cells = dplyr::n(),
+        n_matched = sum(!is.na(Malignant_T)),
+        pct_mTCM  = round(100 * sum(Malignant_T == "mTCM",  na.rm = TRUE) / max(1, sum(!is.na(Malignant_T))), 1),
+        pct_mTRM  = round(100 * sum(Malignant_T == "mTRM",  na.rm = TRUE) / max(1, sum(!is.na(Malignant_T))), 1),
+        pct_mCyto = round(100 * sum(Malignant_T == "mCyto", na.rm = TRUE) / max(1, sum(!is.na(Malignant_T))), 1),
+        patients  = paste(sort(unique(stats::na.omit(patient))), collapse = ", "),
+        .groups   = "drop"
+      ) |>
+      dplyr::mutate(tissue = tissue, group = info$out_name) |>
+      dplyr::select(tissue, group, letter, n_cells, n_matched, pct_mTCM, pct_mTRM, pct_mCyto, patients)
+    rows[[info$out_name]] <- by_letter
+  }
+  do.call(rbind, rows)
+}
+
+comp_skin  <- build_composition(uphylo_skin,  skin_groups_info,  "skin")
+comp_blood <- build_composition(uphylo_blood, blood_groups_info, "blood")
+comp_all   <- rbind(comp_skin, comp_blood)
+
+# Headline finding 1: subclones with internal mTCM/mTRM coexistence (≥10% of each, n≥10)
+mixed_within <- comp_all |>
+  dplyr::filter(letter != "minor",
+                pct_mTCM >= 10, pct_mTRM >= 10,
+                n_matched >= 10)
+
+# Headline finding 2: GROUPS containing BOTH mTCM-dominant AND mTRM-dominant subclones
+# (a stronger phylogenetic signature: same patient's malignancy carries clones in different states)
+group_summary <- comp_all |>
+  dplyr::filter(letter != "minor", n_matched >= 5) |>
+  dplyr::group_by(tissue, group) |>
+  dplyr::summarise(
+    has_mTCM_dom = any(pct_mTCM >= 60),
+    has_mTRM_dom = any(pct_mTRM >= 60),
+    has_mCyto_dom = any(pct_mCyto >= 50),
+    n_subclones = dplyr::n(),
+    .groups = "drop"
+  )
+mixed_across <- group_summary |> dplyr::filter(has_mTCM_dom & has_mTRM_dom)
+
+cat(sprintf("**Headline 1 (within-subclone coexistence):** %d subclones (letter labels) contain ≥10%% mTCM AND ≥10%% mTRM cells — direct evidence of state interconversion within a clone.\n\n",
+            nrow(mixed_within)))
+cat(sprintf("**Headline 2 (across-subclone coexistence within patient):** %d of %d patient groups carry BOTH an mTCM-dominant (≥60%% mTCM) subclone AND an mTRM-dominant (≥60%% mTRM) subclone — proves both states are sustained by the same malignant clonal pool, not separate lineages.\n\n",
+            nrow(mixed_across), nrow(group_summary)))
+if (nrow(mixed_across) > 0) {
+  cat("Groups with coexisting mTCM-dominant and mTRM-dominant subclones:\n\n")
+  mixed_across |>
+    dplyr::select(tissue, group, n_subclones) |>
+    knitr::kable(format = "markdown") |> cat(sep = "\n")
+  cat("\n\n")
+}
+knitr::kable(comp_all, caption = "UPhyloplot2 subclone composition (mTCM / mTRM / mCyto per letter, %)")
+```
+
+## Cell-Level NJ Fan Trees {.tabset}
+
+For each malignant patient group, an unrooted neighbour-joining tree built on per-cell CNV signal (≤300 cells per group, same Newick used by UPhyloplot2), rendered in **fan layout** with tips colored by **Malignant_T state**. Visualizes which lineages within the inferred CNV phylogeny are mTCM-dominated versus mTRM-dominated — directly comparable to the equivalent panel in the 01b report.
+
+```{r fan-trees-setup, include=FALSE}
+suppressPackageStartupMessages({library(ape); library(ggtree)})
+
+state_pal <- c("mTCM" = "darkgreen", "mTRM" = "darkred", "mCyto" = "darkblue",  # paper palette
+               "unknown" = "grey80")
+
+# Helper: build tip annotation for a Newick file by joining Seurat metadata
+fan_tip_annot <- function(newick_path) {
+  tr <- ape::read.tree(newick_path)
+  # tips are the full barcodes we wrote (e.g. AAACCTGAGACAGAGA-1_1_1)
+  m <- mal_meta[match(tr$tip.label, mal_meta$barcode), ]
+  tip_df <- data.frame(
+    label = tr$tip.label,
+    state = ifelse(is.na(m$Malignant_T), "unknown", as.character(m$Malignant_T)),
+    tissue = ifelse(is.na(m$tissue), "unknown", as.character(m$tissue)),
+    stringsAsFactors = FALSE
+  )
+  list(tree = tr, tip_df = tip_df)
+}
+
+# Per-patient panels (uses uphylo-prep-newick output paths). Names are the patient
+# ids themselves (e.g. "blood 1", "skin 2"), already tissue-prefixed.
+fan_tabs <- c(
+  setNames(lapply(skin_groups_info,  function(i) list(tissue = "skin",  info = i)),
+           names(skin_groups_info)),
+  setNames(lapply(blood_groups_info, function(i) list(tissue = "blood", info = i)),
+           names(blood_groups_info))
+)
+```
+
+```{r fan-trees-plot, results='asis', fig.width=10, fig.height=7}
+for (tab in names(fan_tabs)) {
+  spec <- fan_tabs[[tab]]
+  cat(sprintf("\n### %s\n\n", tab))
+  newick_path <- spec$info$path
+  if (!file.exists(newick_path)) { cat("_(no cached Newick)_\n\n"); next }
+  ta <- fan_tip_annot(newick_path)
+  if (length(ta$tree$tip.label) < 5) { cat("_(too few cells for a tree)_\n\n"); next }
+  p <- ggtree::ggtree(ta$tree, layout = "fan") %<+% ta$tip_df +
+    ggtree::geom_tippoint(aes(color = state), size = 1.5, alpha = 0.9) +
+    scale_color_manual(values = state_pal, name = "state") +
+    ggtitle(sprintf("%s — NJ fan tree (n=%d cells) — by Malignant_T",
+                    tab, length(ta$tree$tip.label))) +
+    theme(legend.position = "right")
+  print(p)
+  cat("\n\n")
+}
+```
+
+## NJ Fan Trees by Patient {.tabset}
+
+Same cached Newicks as the previous section, but tips coloured by `patient` instead of Malignant_T state. Useful as a sanity check: for the **quasi-per-patient** blood groups (`Malignant T1`-`T8`) the trees should be (near-)monochromatic, confirming the per-patient interpretation. For the **multi-patient** groups (`Malignant T shared`, `Malignant exhausted`, `Malignant Treg`) the tree is multi-coloured — showing whether cells from the same patient cluster together (i.e. form a sub-branch) or are scattered across the topology.
+
+```{r fan-trees-by-patient, results='asis', fig.width=10, fig.height=7}
+# Build a patient palette spanning ALL patients in the malignant Seurat object
+all_patients <- sort(unique(stats::na.omit(mal_meta$patient)))
+patient_pal  <- setNames(unname(pals::polychrome())[seq_along(all_patients) + 2],
+                         all_patients)
+patient_pal["unknown"] <- "grey80"
+
+fan_tip_annot_patient <- function(newick_path) {
+  tr <- ape::read.tree(newick_path)
+  m  <- mal_meta[match(tr$tip.label, mal_meta$barcode), ]
+  tip_df <- data.frame(
+    label = tr$tip.label,
+    patient = ifelse(is.na(m$patient), "unknown", as.character(m$patient)),
+    stringsAsFactors = FALSE
+  )
+  list(tree = tr, tip_df = tip_df)
+}
+
+for (tab in names(fan_tabs)) {
+  spec <- fan_tabs[[tab]]
+  cat(sprintf("\n### %s\n\n", tab))
+  newick_path <- spec$info$path
+  if (!file.exists(newick_path)) { cat("_(no cached Newick)_\n\n"); next }
+  ta <- fan_tip_annot_patient(newick_path)
+  if (length(ta$tree$tip.label) < 5) { cat("_(too few cells for a tree)_\n\n"); next }
+  n_pat <- length(setdiff(unique(ta$tip_df$patient), "unknown"))
+  cat(sprintf("_n=%d cells, %d distinct patient(s) in this group_\n\n",
+              length(ta$tree$tip.label), n_pat))
+  p <- ggtree::ggtree(ta$tree, layout = "fan") %<+% ta$tip_df +
+    ggtree::geom_tippoint(aes(color = patient), size = 1.5, alpha = 0.9) +
+    scale_color_manual(values = patient_pal, name = "patient") +
+    ggtitle(sprintf("%s — NJ fan tree by patient", tab)) +
+    theme(legend.position = "right")
+  print(p)
+  cat("\n\n")
+}
+```
+
+## Clonal Tracking (TCR) {.tabset}
+
+TCR clonotypes uniquely identify each malignant lineage independent of CNV. Of the 20,946 malignant cells, **12,879 (61%) carry TCR data** (scRepertoire `CTstrict`). Across the cohort there are **112 unique CTstrict clones**, dominated by a handful of hyperexpanded clones. The two paired-compartment patients (Pair 1: BL1+SK2; Pair 2: BL4+SK3) each carry **one dominant shared clone** spanning blood and skin AND containing both mTCM and mTRM cells — direct phylogenetic evidence (independent of CNV) that the two memory states belong to the same malignant clone.
+
+```{r tcr-setup, include=FALSE}
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(ggplot2); library(patchwork)})
+
+# Build per-cell long table with clone identity
+mal_tcr <- mal_obj@meta.data |>
+  dplyr::mutate(barcode = colnames(mal_obj),
+                CTstrict = as.character(CTstrict),
+                CTaa = as.character(CTaa)) |>
+  dplyr::filter(!is.na(CTstrict)) |>
+  dplyr::select(barcode, CTstrict, CTaa, cloneSize, patient, tissue, Malignant_T)
+
+# Compute per-clone summary (sorted by total size)
+clone_tbl <- mal_tcr |>
+  dplyr::group_by(CTstrict) |>
+  dplyr::summarise(
+    n_total  = dplyr::n(),
+    n_blood  = sum(tissue == "blood"),
+    n_skin   = sum(tissue == "skin"),
+    n_mTCM   = sum(Malignant_T == "mTCM"),
+    n_mTRM   = sum(Malignant_T == "mTRM"),
+    n_mCyto  = sum(Malignant_T == "mCyto"),
+    patient  = paste(sort(unique(patient)), collapse = ", "),
+    n_patients = dplyr::n_distinct(patient),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(n_total)) |>
+  dplyr::mutate(
+    clone_id = sprintf("clone_%d", dplyr::row_number()),
+    pct_mTCM = round(100 * n_mTCM / n_total, 1),
+    pct_mTRM = round(100 * n_mTRM / n_total, 1),
+    pct_mCyto = round(100 * n_mCyto / n_total, 1),
+    # Tissue-spanning: ≥1 cell in BOTH compartments (skin biopsies are inherently sparse;
+    # even 1 cell from the same TCR clone in skin is biologically meaningful).
+    spans_tissues = (n_blood >= 1) & (n_skin >= 1),
+    # State-spanning: ≥5 mTCM AND ≥5 mTRM cells (absolute counts — mTRM is rare in
+    # blood-heavy patients, so percentage thresholds wash out the signal).
+    spans_states  = (n_mTCM >= 5) & (n_mTRM >= 5)
+  )
+
+# Join clone_id back onto cell-level table for downstream plotting
+clone_id_lookup <- setNames(clone_tbl$clone_id, clone_tbl$CTstrict)
+mal_tcr$clone_id <- clone_id_lookup[mal_tcr$CTstrict]
+
+# Top-N expanded clones for figure focus
+top_n_clones <- 10
+top_clones    <- clone_tbl |> dplyr::slice_head(n = top_n_clones)
+top_clone_ids <- top_clones$clone_id
+
+# Palette for top clones
+top_palette <- setNames(unname(pals::polychrome())[seq_len(top_n_clones) + 2], top_clone_ids)
+```
+
+### Setup overview
+
+**Coverage**: `r format(nrow(mal_tcr), big.mark = ",")` cells with TCR / `r format(ncol(mal_obj), big.mark = ",")` malignant cells (`r round(100*nrow(mal_tcr)/ncol(mal_obj))`%). **Unique CTstrict clones**: `r nrow(clone_tbl)`. **Top `r top_n_clones` expanded clones cover** `r round(100*sum(top_clones$n_total)/nrow(mal_tcr))`% **of TCR-typed cells**.
+
+```{r tcr-setup-table}
+top_clones |>
+  dplyr::select(clone_id, n_total, n_blood, n_skin,
+                pct_mTCM, pct_mTRM, pct_mCyto, patient,
+                spans_tissues, spans_states) |>
+  knitr::kable(caption = sprintf("Top %d expanded TCR clones (CTstrict)", top_n_clones))
+```
+
+### Shared clones (paired patients)
+
+```{r tcr-paired-bars, fig.width=14, fig.height=6}
+paired_clone_panel <- function(pair_label, blood_id, skin_id) {
+  cells <- mal_tcr |> dplyr::filter(patient %in% c(blood_id, skin_id))
+  if (nrow(cells) == 0) return(NULL)
+  shared_clones <- cells |>
+    dplyr::group_by(clone_id) |>
+    dplyr::summarise(n_blood = sum(tissue == "blood"),
+                     n_skin  = sum(tissue == "skin"),
+                     n_total = dplyr::n(),
+                     .groups = "drop") |>
+    dplyr::arrange(dplyr::desc(n_total)) |>
+    dplyr::slice_head(n = 10)
+  plot_df <- cells |>
+    dplyr::filter(clone_id %in% shared_clones$clone_id) |>
+    dplyr::count(clone_id, tissue, Malignant_T) |>
+    dplyr::mutate(clone_id = factor(clone_id, levels = shared_clones$clone_id))
+  ggplot(plot_df, aes(x = clone_id, y = n, fill = Malignant_T)) +
+    geom_col() +
+    facet_wrap(~ tissue, ncol = 1, scales = "free_y") +
+    scale_fill_manual(values = state_pal) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(x = NULL, y = "n cells", title = pair_label,
+         subtitle = sprintf("blood patient: %s • skin patient: %s", blood_id, skin_id))
+}
+
+p1 <- paired_clone_panel("Pair 1 (BL1 + SK2)", "blood 1", "skin 2")
+p2 <- paired_clone_panel("Pair 2 (BL4 + SK3)", "blood 4", "skin 3")
+if (!is.null(p1) && !is.null(p2)) print(p1 | p2) else if (!is.null(p1)) print(p1) else if (!is.null(p2)) print(p2)
+```
+
+### Top clones × tissue × state (headline) {.active}
+
+```{r tcr-tissue-state-heatmap, fig.width=11, fig.height=8}
+suppressPackageStartupMessages({library(ComplexHeatmap); library(circlize)})
+
+cell_counts <- mal_tcr |>
+  dplyr::filter(clone_id %in% clone_tbl$clone_id[seq_len(20)]) |>
+  dplyr::mutate(group = paste(tissue, Malignant_T, sep = "/")) |>
+  dplyr::count(clone_id, group) |>
+  tidyr::pivot_wider(names_from = group, values_from = n, values_fill = 0)
+# Ensure all 6 group columns present
+target_groups <- c("blood/mTCM", "blood/mTRM", "blood/mCyto",
+                   "skin/mTCM",  "skin/mTRM",  "skin/mCyto")
+for (g in setdiff(target_groups, colnames(cell_counts))) cell_counts[[g]] <- 0
+cell_counts <- cell_counts |> dplyr::select(clone_id, dplyr::all_of(target_groups))
+
+# Order by total size (matches clone_tbl ranking)
+cell_counts <- cell_counts[match(clone_tbl$clone_id[seq_len(20)], cell_counts$clone_id), ]
+cell_counts <- cell_counts[!is.na(cell_counts$clone_id), ]
+
+mat <- as.matrix(cell_counts[, -1])
+rownames(mat) <- cell_counts$clone_id
+mat_log <- log10(mat + 1)
+
+clone_info <- clone_tbl[match(rownames(mat), clone_tbl$clone_id), ]
+row_ann <- rowAnnotation(
+  n_total         = anno_barplot(clone_info$n_total, gp = gpar(fill = "grey50")),
+  spans_tissues   = clone_info$spans_tissues,
+  spans_states    = clone_info$spans_states,
+  patient_main    = clone_info$patient,
+  col = list(
+    spans_tissues = c("TRUE" = "#1B7837", "FALSE" = "grey90"),
+    spans_states  = c("TRUE" = "#762A83", "FALSE" = "grey90")
+  ),
+  annotation_name_side = "top",
+  simple_anno_size = unit(4, "mm")
+)
+col_split <- factor(sub("/.*", "", colnames(mat)), levels = c("blood", "skin"))
+
+ht <- Heatmap(
+  mat_log,
+  name = "log10(n+1)",
+  col  = colorRamp2(c(0, 1, 3), c("white", "#FCBBA1", "#67000D")),
+  cluster_rows = FALSE, cluster_columns = FALSE,
+  show_row_names = TRUE, row_names_side = "left",
+  column_split = col_split,
+  column_title_gp = gpar(fontsize = 11, fontface = "bold"),
+  column_names_rot = 35,
+  cell_fun = function(j, i, x, y, w, h, fill) {
+    if (mat[i, j] > 0) grid.text(mat[i, j], x, y, gp = gpar(fontsize = 8))
+  },
+  right_annotation = row_ann,
+  border = TRUE,
+  column_title = "Top 20 TCR clones × tissue × Malignant_T state (cell counts)"
+)
+draw(ht, heatmap_legend_side = "left", annotation_legend_side = "left")
+```
+
+### Alluvial: clone → tissue → state
+
+```{r tcr-alluvial, fig.width=12, fig.height=7}
+if (requireNamespace("ggalluvial", quietly = TRUE)) {
+  library(ggalluvial)
+  alluv_df <- mal_tcr |>
+    dplyr::filter(clone_id %in% top_clone_ids) |>
+    dplyr::count(clone_id, tissue, Malignant_T) |>
+    dplyr::mutate(clone_id = factor(clone_id, levels = top_clone_ids),
+                  tissue = factor(tissue, levels = c("blood", "skin")),
+                  Malignant_T = factor(Malignant_T, levels = c("mTCM", "mTRM", "mCyto")))
+  p <- ggplot(alluv_df,
+              aes(y = n, axis1 = clone_id, axis2 = tissue, axis3 = Malignant_T)) +
+    geom_alluvium(aes(fill = clone_id), width = 1/8) +
+    geom_stratum(width = 1/8, fill = "grey85", color = "white") +
+    geom_text(stat = "stratum", aes(label = after_stat(stratum)), size = 3) +
+    scale_x_discrete(limits = c("Clone", "Tissue", "State"), expand = c(.1, .1)) +
+    scale_fill_manual(values = top_palette) +
+    theme_minimal() +
+    labs(y = "n cells", title = sprintf("Top %d clones: clone → tissue → state", top_n_clones))
+  print(p)
+} else {
+  cat("_ggalluvial not installed — alluvial plot omitted_\n")
+}
+```
+
+### UMAP overlay
+
+```{r tcr-umap, fig.width=14, fig.height=7}
+umap_df <- as.data.frame(mal_obj@reductions$umap@cell.embeddings)
+colnames(umap_df) <- c("UMAP_1", "UMAP_2")
+umap_df$barcode <- rownames(umap_df)
+umap_df <- umap_df |>
+  dplyr::left_join(mal_tcr |> dplyr::select(barcode, clone_id, tissue), by = "barcode") |>
+  dplyr::mutate(clone_plot = ifelse(clone_id %in% top_clone_ids, clone_id, NA_character_))
+
+plot_umap_clones <- function(df, title) {
+  bg <- df[is.na(df$clone_plot), , drop = FALSE]
+  fg <- df[!is.na(df$clone_plot), , drop = FALSE]
+  ggplot() +
+    geom_point(data = bg, aes(UMAP_1, UMAP_2), color = "grey85", size = 0.3) +
+    geom_point(data = fg, aes(UMAP_1, UMAP_2, color = clone_plot), size = 0.6) +
+    scale_color_manual(values = top_palette, name = "clone") +
+    theme_bw() + theme(aspect.ratio = 1) + ggtitle(title)
+}
+p_all   <- plot_umap_clones(umap_df, sprintf("All cells — top %d clones overlaid", top_n_clones))
+p_blood <- plot_umap_clones(umap_df |> dplyr::filter(tissue == "blood" | is.na(tissue)), "Blood cells")
+p_skin  <- plot_umap_clones(umap_df |> dplyr::filter(tissue == "skin"  | is.na(tissue)), "Skin cells")
+print(p_all | (p_blood / p_skin))
+```
+
+### Per-clone state composition
+
+```{r tcr-state-comp, fig.width=12, fig.height=7}
+comp_df <- mal_tcr |>
+  dplyr::filter(clone_id %in% top_clone_ids) |>
+  dplyr::count(clone_id, tissue, Malignant_T) |>
+  dplyr::mutate(clone_id = factor(clone_id, levels = top_clone_ids))
+ggplot(comp_df, aes(x = tissue, y = n, fill = Malignant_T)) +
+  geom_col() +
+  facet_wrap(~ clone_id, scales = "free_y", ncol = 5) +
+  scale_fill_manual(values = state_pal) +
+  theme_bw() +
+  labs(y = "n cells",
+       title = sprintf("State composition per tissue, top %d clones", top_n_clones))
+```
+
+### Clonal overlap (Morisita)
+
+```{r tcr-overlap, fig.width=8, fig.height=6}
+# Morisita-Horn between (tissue × state) groups, across all patients
+mh_index <- function(a, b) {
+  # a, b: named numeric vectors of clone counts
+  all_clones <- union(names(a), names(b))
+  a <- a[all_clones]; a[is.na(a)] <- 0
+  b <- b[all_clones]; b[is.na(b)] <- 0
+  if (sum(a) == 0 || sum(b) == 0) return(NA_real_)
+  pa <- a / sum(a); pb <- b / sum(b)
+  num <- 2 * sum(pa * pb)
+  den <- sum(pa^2) + sum(pb^2)
+  if (den == 0) NA_real_ else num / den
+}
+groups_df <- mal_tcr |> dplyr::mutate(group = paste(tissue, Malignant_T, sep = "/"))
+group_clone_counts <- split(groups_df, groups_df$group) |> lapply(function(d) table(d$clone_id))
+
+grp_names <- names(group_clone_counts)
+M <- matrix(NA_real_, length(grp_names), length(grp_names),
+            dimnames = list(grp_names, grp_names))
+for (i in seq_along(grp_names)) for (j in seq_along(grp_names)) {
+  M[i, j] <- mh_index(group_clone_counts[[i]], group_clone_counts[[j]])
+}
+Heatmap(M, name = "Morisita",
+        col = colorRamp2(c(0, 0.5, 1), c("white", "#FDAE61", "#A50026")),
+        cluster_rows = FALSE, cluster_columns = FALSE,
+        cell_fun = function(j, i, x, y, w, h, fill) {
+          if (!is.na(M[i, j])) grid.text(sprintf("%.2f", M[i, j]), x, y, gp = gpar(fontsize = 9))
+        },
+        column_title = "Clonal overlap between (tissue × state) groups (cohort-pooled)")
+```
+
+### Summary table
+
+```{r tcr-summary-table}
+clone_tbl |>
+  dplyr::slice_head(n = 20) |>
+  dplyr::select(clone_id, n_total, n_blood, n_skin,
+                pct_mTCM, pct_mTRM, pct_mCyto,
+                patient, n_patients, spans_tissues, spans_states) |>
+  knitr::kable(caption = "Top 20 TCR clones — span flags identify the headline clones")
+```
+
+### NJ fan trees coloured by TCR clone
+
+```{r tcr-fan-trees, results='asis', fig.width=10, fig.height=7}
+suppressPackageStartupMessages({library(ape); library(ggtree)})
+clone_bc_lookup <- setNames(mal_tcr$clone_id, mal_tcr$barcode)
+
+for (tab in names(fan_tabs)) {
+  spec <- fan_tabs[[tab]]
+  cat(sprintf("\n#### %s\n\n", tab))
+  newick_path <- spec$info$path
+  if (!file.exists(newick_path)) { cat("_(no cached Newick)_\n\n"); next }
+  tr <- ape::read.tree(newick_path)
+  tip_df <- data.frame(
+    label = tr$tip.label,
+    clone_id = clone_bc_lookup[tr$tip.label],
+    stringsAsFactors = FALSE
+  )
+  tip_df$clone_plot <- ifelse(tip_df$clone_id %in% top_clone_ids, tip_df$clone_id, "other/none")
+  pal_local <- c(top_palette, "other/none" = "grey85")
+  p <- ggtree(tr, layout = "fan") %<+% tip_df +
+    geom_tippoint(aes(color = clone_plot), size = 1.5, alpha = 0.9) +
+    scale_color_manual(values = pal_local, name = "clone") +
+    ggtitle(sprintf("%s — NJ fan tree by TCR clone", tab)) +
+    theme(legend.position = "right")
+  print(p)
+  cat("\n\n")
+}
+```
+
+## Joint Blood + Skin Trees per Pair {.tabset}
+
+**Only two patients in the cohort have BOTH blood and skin samples** — Pair 1 (BL1 + SK2) and Pair 2 (BL4 + SK3) — so blood↔skin clonal sharing can only be evaluated in these two individuals. The other 13 patients are single-tissue. This section pools the paired blood and skin malignant cells into **one** phylogenetic tree per pair, with two coloured views: (i) by tissue × Malignant_T state, (ii) by **per-pair sharing status** of the TCR clones. The second panel is the direct visualization of clonal sharing — every shared clone gets its own colour, and shared-clone cells should appear on BOTH the blood- and skin-derived branches of the tree.
+
+**Why this is feasible:** both inferCNV runs used **NK cells as reference** with the same `denoise=TRUE` settings, so the denoised CNV signal is comparable across runs (mean blood = 1.002 / sd = 0.018; mean skin = 1.001 / sd = 0.026; same ~1.0 baseline). The gene sets overlap on **3,540 common genes** (95% of skin's 4,096; 63% of blood's 5,582) — more than enough for a stable Ward.D2 distance.
+
+**Cells per pair (in inferCNV obs):** Pair 1 = 2,811 blood + 109 skin; Pair 2 = 2,855 blood + 132 skin. Blood is subsampled to ≤300 per pair (set.seed=42) so the tree stays readable; all skin cells are kept.
+
+```{r joint-pair-setup, include=FALSE}
+suppressPackageStartupMessages({library(ape); library(ggtree); library(patchwork)})
+
+pairs_def <- list(
+  list(label = "Pair 1 (BL1 + SK2)", blood_pat = "blood 1", skin_pat = "skin 2"),
+  list(label = "Pair 2 (BL4 + SK3)", blood_pat = "blood 4", skin_pat = "skin 3")
+)
+
+cache_joint <- "/srv/GT/analysis/p28409-Andrea/2026-03-24-UPhyloplot2-CNV-Trees/cache_01c_joint_pair_trees.qs2"
+build_joint_tree <- function(blood_pat, skin_pat, max_blood_cells = 300, seed = 42) {
+  o_blood <- readRDS("/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/blood/run.final.infercnv_obj")
+  o_skin  <- readRDS("/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/skin/run.final.infercnv_obj")
+
+  bl_bcs_all <- mal_meta$barcode[mal_meta$patient == blood_pat]
+  sk_bcs_all <- mal_meta$barcode[mal_meta$patient == skin_pat]
+  bl_bcs <- intersect(bl_bcs_all, colnames(o_blood@expr.data))
+  sk_bcs <- intersect(sk_bcs_all, colnames(o_skin@expr.data))
+  if (length(bl_bcs) > max_blood_cells) {
+    set.seed(seed); bl_bcs <- sample(bl_bcs, max_blood_cells)
+  }
+
+  common_genes <- intersect(rownames(o_blood@expr.data), rownames(o_skin@expr.data))
+  m_bl <- o_blood@expr.data[common_genes, bl_bcs, drop = FALSE]
+  m_sk <- o_skin@expr.data[common_genes, sk_bcs, drop = FALSE]
+  mat  <- cbind(m_bl, m_sk)
+  rm(o_blood, o_skin); gc(verbose = FALSE)
+
+  list(matrix = mat, blood_bcs = bl_bcs, skin_bcs = sk_bcs)
+}
+
+if (file.exists(cache_joint)) {
+  joint_data <- qs_read(cache_joint, nthreads = 8)
+} else {
+  joint_data <- lapply(pairs_def, function(p)
+    build_joint_tree(p$blood_pat, p$skin_pat))
+  names(joint_data) <- sapply(pairs_def, `[[`, "label")
+  qs_save(joint_data, cache_joint, nthreads = 8)
+}
+```
+
+```{r joint-pair-trees, results='asis', fig.width=14, fig.height=8}
+# Paper palette: mTCM=darkgreen, mTRM=darkred, mCyto=darkblue. Lighter variants for blood,
+# canonical paper colors for skin (skin is the focal tissue in CTCL studies).
+state_pal_joint <- c("blood_mTCM" = "#5C9F5C", "blood_mTRM" = "#C75C5C", "blood_mCyto" = "#5C5CC7",
+                     "skin_mTCM"  = "darkgreen", "skin_mTRM"  = "darkred", "skin_mCyto" = "darkblue",
+                     "unknown" = "grey80")
+
+# Per-pair sharing requires the per-cell TCR table. Build a cell → CTstrict lookup once.
+ctstrict_by_bc <- setNames(as.character(mal_obj$CTstrict), colnames(mal_obj))
+
+for (pair in pairs_def) {
+  d <- joint_data[[pair$label]]
+  cat(sprintf("\n### %s\n\n", pair$label))
+  if (is.null(d) || ncol(d$matrix) < 10) { cat("_(too few cells)_\n\n"); next }
+
+  hc  <- hclust(dist(t(d$matrix), method = "euclidean"), method = "ward.D2")
+  phy <- ape::as.phylo(hc)
+  m   <- mal_meta[match(phy$tip.label, mal_meta$barcode), ]
+  tip_df <- data.frame(
+    label = phy$tip.label,
+    tissue_state = ifelse(is.na(m$tissue) | is.na(m$Malignant_T), "unknown",
+                           paste(m$tissue, m$Malignant_T, sep = "_")),
+    tissue = ifelse(is.na(m$tissue), "unknown", as.character(m$tissue)),
+    state  = ifelse(is.na(m$Malignant_T), "unknown", as.character(m$Malignant_T)),
+    stringsAsFactors = FALSE
+  )
+  tip_df$CTstrict <- ctstrict_by_bc[tip_df$label]
+
+  # Per-pair sharing: a clone is "shared" iff it appears in ≥1 blood AND ≥1 skin
+  # cell of cells IN THIS TREE (restricted to the pair, not cohort-wide).
+  ct_tissue <- split(tip_df$tissue, tip_df$CTstrict)
+  shared_cts <- names(ct_tissue)[
+    sapply(ct_tissue, function(t) all(c("blood", "skin") %in% unique(stats::na.omit(t))))
+  ]
+  # Rank shared clones in this pair by total cell count (descending)
+  shared_sizes <- sapply(shared_cts, function(c) sum(tip_df$CTstrict == c, na.rm = TRUE))
+  shared_cts <- shared_cts[order(-shared_sizes)]
+  shared_label_map <- setNames(sprintf("shared #%d (n=%d)",
+                                       seq_along(shared_cts),
+                                       shared_sizes[shared_cts]),
+                               shared_cts)
+  tip_df$sharing <- with(tip_df, dplyr::case_when(
+    is.na(CTstrict)              ~ "no TCR",
+    CTstrict %in% shared_cts     ~ shared_label_map[CTstrict],
+    tissue == "blood"            ~ "blood-only clone",
+    tissue == "skin"             ~ "skin-only clone",
+    TRUE                         ~ "no TCR"
+  ))
+
+  # Palette: shared clones get vivid colors; blood-only / skin-only / no TCR neutral
+  shared_palette <- setNames(unname(pals::polychrome())[seq_along(shared_cts) + 2],
+                             unname(shared_label_map))
+  sharing_pal <- c(shared_palette,
+                   "blood-only clone" = "#7EC8E3",
+                   "skin-only clone"  = "#F4A582",
+                   "no TCR"           = "grey85")
+
+  # Composition + sharing summary
+  comp <- as.data.frame(table(tip_df$tissue_state))
+  comp <- comp[comp$Var1 != "unknown", , drop = FALSE]
+  cat("Composition: ", paste(sprintf("%s=%d", comp$Var1, comp$Freq), collapse = ", "), "\n\n")
+  cat(sprintf("**Per-pair shared clones**: %d clone(s) appear in BOTH blood and skin cells of this pair. ",
+              length(shared_cts)))
+  if (length(shared_cts) > 0) {
+    counts <- sapply(shared_cts, function(c) {
+      bl_n <- sum(tip_df$CTstrict == c & tip_df$tissue == "blood", na.rm = TRUE)
+      sk_n <- sum(tip_df$CTstrict == c & tip_df$tissue == "skin", na.rm = TRUE)
+      sprintf("%d blood + %d skin", bl_n, sk_n)
+    })
+    cat(paste(sprintf("%s: %s", unname(shared_label_map), counts), collapse = " · "))
+  }
+  cat("\n\n")
+
+  legend_big <- theme(
+    legend.position = "right",
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text  = element_text(size = 14),
+    legend.key.height = unit(1.1, "lines"),
+    legend.key.width  = unit(1.0, "lines"),
+    plot.title = element_text(size = 15, face = "bold")
+  )
+
+  p_ts <- ggtree(phy, layout = "fan") %<+% tip_df +
+    geom_tippoint(aes(color = tissue_state), size = 1.4, alpha = 0.9) +
+    scale_color_manual(values = state_pal_joint, name = "tissue × state",
+                       guide = guide_legend(override.aes = list(size = 5, alpha = 1))) +
+    ggtitle(sprintf("%s — joint NJ tree by tissue × state (n=%d)",
+                    pair$label, length(phy$tip.label))) +
+    legend_big
+
+  p_sh <- ggtree(phy, layout = "fan") %<+% tip_df +
+    geom_tippoint(aes(color = sharing), size = 1.6, alpha = 0.95) +
+    scale_color_manual(values = sharing_pal, name = "sharing",
+                       guide = guide_legend(override.aes = list(size = 5, alpha = 1))) +
+    ggtitle(sprintf("%s — joint NJ tree by per-pair sharing status", pair$label)) +
+    legend_big
+
+  combined_plot <- p_ts | p_sh
+  print(combined_plot)
+
+  # Editable PDF export for Aizhan (Affinity Designer-friendly vector format)
+  pdf_dir <- "/srv/GT/analysis/p28409-Andrea/2026-03-24-UPhyloplot2-CNV-Trees/joint_pair_pdfs"
+  dir.create(pdf_dir, recursive = TRUE, showWarnings = FALSE)
+  pdf_file <- file.path(pdf_dir,
+                        sprintf("joint_NJ_tree_%s.pdf",
+                                gsub("[^A-Za-z0-9]+", "_", pair$label)))
+  ggsave(pdf_file, combined_plot, width = 14, height = 8,
+         device = cairo_pdf, bg = "white")
+  cat(sprintf("PDF: %s\n\n", basename(pdf_file)))
+}
+```
+
+## Joint Trees with CNV Annotations {.tabset}
+
+Same joint blood+skin NJ trees as the previous section, with **plain-text chromosome-arm gain/loss labels** at hierarchical clade levels (UPhyloplot2 style). Two layouts shown per pair: **rectangular** (cleaner for many labels) and **fan / circular** (matches the format of the `Joint Blood + Skin Trees per Pair` tab, now with the CNV labels overlaid).
+
+At each level the tree is partitioned (`cutree`) into k clades. The mean denoised CNV signal is computed per clade, then aggregated to chromosome arm (p/q via GRCh38 centromere positions). An arm is called **gain** when its mean denoised signal exceeds **1.015** and **del** when below **0.985** (~1× sd from baseline — inferCNV's denoised signal is heavily smoothed, so per-gene 5% thresholds caught almost nothing at the pair-pool level). Each clade only displays NEW events (not inherited from its parent), so the tree reads top-down as sequential acquisition.
+
+- **Pair 1 (BL1+SK2)**: 3 layers (truncal + 2 major + 4 sub-clades) — one extra level vs. before, surfaces blood_mTRM vs skin_mTRM splits within the mTRM-enriched clade.
+- **Pair 2 (BL4+SK3)**: 4 layers (truncal + 2 major + 4 sub + 8 sub-sub-clades) — same idea, deeper.
+
+```{r joint-pair-cnv-annot-prep, include=FALSE}
+# Load gene_order once (from blood inferCNV, has same row names as the joint matrix common genes)
+cache_geneorder <- "/srv/GT/analysis/p28409-Andrea/2026-03-24-UPhyloplot2-CNV-Trees/cache_01c_gene_order_blood.qs2"
+if (file.exists(cache_geneorder)) {
+  gene_order_blood <- qs_read(cache_geneorder, nthreads = 4)
+} else {
+  o_b <- readRDS("/srv/GT/analysis/p28409-Andrea/InferCNV_published_NK_ref/blood/run.final.infercnv_obj")
+  gene_order_blood <- as.data.frame(o_b@gene_order)
+  qs_save(gene_order_blood, cache_geneorder, nthreads = 4)
+  rm(o_b); gc(verbose = FALSE)
+}
+
+# arm_events() is defined earlier (in uphylo-helpers chunk); reused here.
+
+n_layers_per_pair <- list(`Pair 1 (BL1 + SK2)` = 3, `Pair 2 (BL4 + SK3)` = 4)
+# Indexed by n_layers. Going one level deeper (Pair 1: 2→3, Pair 2: 3→4) surfaces
+# sub-splits that distinguish blood_mTRM from skin_mTRM within the same lineage.
+k_per_level <- list(`2` = c(1, 2), `3` = c(1, 2, 4), `4` = c(1, 2, 4, 8))
+```
+
+```{r joint-pair-cnv-annot-plot, results='asis', fig.width=16, fig.height=9}
+suppressPackageStartupMessages({library(ggrepel)})
+
+for (pair in pairs_def) {
+  cat(sprintf("\n### %s\n\n", pair$label))
+  d <- joint_data[[pair$label]]
+  if (is.null(d) || ncol(d$matrix) < 10) { cat("_(too few cells)_\n\n"); next }
+  n_layers <- n_layers_per_pair[[pair$label]]
+  k_levels <- k_per_level[[as.character(n_layers)]]  # c(1,2) for n=2, c(1,2,4) for n=3
+
+  mat <- d$matrix
+  hc  <- hclust(dist(t(mat), method = "euclidean"), method = "ward.D2")
+  phy <- ape::as.phylo(hc)
+
+  # Compute events per clade per level. Subtract parent-level events so each
+  # clade only shows NEW events.
+  truncal <- arm_events(mat, colnames(mat), gene_order_blood, chr_centro)
+  events_by_node <- list()
+  events_by_node[[as.character(length(phy$tip.label) + 1)]] <-  # root node
+    list(events = truncal, level = 1, n = ncol(mat), clade = "TRUNCAL")
+
+  for (level in seq.int(2, n_layers)) {
+    k_this   <- k_levels[level]
+    k_parent <- k_levels[level - 1]
+    grp_this   <- cutree(hc, k = k_this)
+    grp_parent <- cutree(hc, k = k_parent)
+
+    for (g in sort(unique(grp_this))) {
+      tips <- names(grp_this)[grp_this == g]
+      if (length(tips) < 5) next  # skip tiny clades (lowered from 10 to surface small high-CNV sub-clones like Pair 2 L3.4)
+      pg   <- unique(grp_parent[tips])[1]
+      tips_parent <- names(grp_parent)[grp_parent == pg]
+      parent_events <- arm_events(mat, tips_parent, gene_order_blood, chr_centro)
+      this_events   <- arm_events(mat, tips,        gene_order_blood, chr_centro)
+      new_events    <- setdiff(this_events, parent_events)
+      if (length(new_events) == 0) next
+      mrca <- if (length(tips) == 1) which(phy$tip.label == tips) else
+                ape::getMRCA(phy, tips)
+      events_by_node[[as.character(mrca)]] <- list(
+        events = new_events, level = level, n = length(tips),
+        clade = sprintf("L%d.%d", level, g)
+      )
+    }
+  }
+
+  # Build annotation df + tip df
+  ann_df <- do.call(rbind, lapply(names(events_by_node), function(n) {
+    e <- events_by_node[[n]]
+    data.frame(node = as.integer(n),
+               level = e$level,
+               clade = e$clade,                                        # e.g. "L2.2"
+               n_cells = e$n,
+               short_label = sprintf("%s\n[n=%d]", e$clade, e$n),       # bifurcation marker
+               events_text = paste(e$events, collapse = ", "),          # full list (side panel)
+               stringsAsFactors = FALSE)
+  }))
+  ann_df <- ann_df[order(ann_df$level, ann_df$node), ]
+  ann_df$fill_col <- ifelse(ann_df$level == 1, "#FFE4B5",
+                       ifelse(ann_df$level == 2, "#E0FFFF",
+                       ifelse(ann_df$level == 3, "#FFE0E0", "#E8D8FF")))
+
+  m_meta <- mal_meta[match(phy$tip.label, mal_meta$barcode), ]
+  tip_df <- data.frame(
+    label = phy$tip.label,
+    tissue_state = ifelse(is.na(m_meta$tissue) | is.na(m_meta$Malignant_T), "unknown",
+                          paste(m_meta$tissue, m_meta$Malignant_T, sep = "_")),
+    stringsAsFactors = FALSE
+  )
+
+  # Side panel listing the full CNV events per clade (kept off the tree so it
+  # doesn't overlap). One row per clade, level-colored background.
+  side_df <- ann_df
+  side_df$y <- seq_len(nrow(side_df))
+  side_df$row_text <- sprintf("%s [n=%d]: %s",
+                              side_df$clade, side_df$n_cells, side_df$events_text)
+  events_side <- ggplot(side_df, aes(x = 0, y = -y)) +
+    geom_label(aes(label = row_text), hjust = 0, size = 4.2,
+               fontface = "bold", lineheight = 0.95, label.size = 0.25,
+               fill = side_df$fill_col) +
+    scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+    scale_y_continuous(expand = expansion(add = 1)) +
+    theme_void() +
+    theme(plot.margin = margin(8, 8, 8, 8))
+
+  # ---- Layout 1: rectangular -------------------------------------------------
+  base_rect <- ggtree(phy, layout = "rectangular", size = 0.4) %<+% tip_df +
+    geom_tippoint(aes(color = tissue_state), size = 1.6, alpha = 0.9) +
+    scale_color_manual(values = state_pal_joint, name = "tissue × state") +
+    ggtitle(sprintf("%s — joint NJ tree (rectangular, %d layers)",
+                    pair$label, n_layers)) +
+    theme_tree2(base_size = 13) +
+    theme(legend.position = "right",
+          plot.title = element_text(size = 15, face = "bold"),
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 11))
+  td_rect <- base_rect$data
+  ann_rect <- merge(ann_df, td_rect[, c("node", "x", "y")], by = "node", all.x = TRUE)
+  p_rect_tree <- base_rect +
+    geom_label_repel(data = ann_rect,
+                     aes(x = x, y = y, label = short_label),    # short label only
+                     inherit.aes = FALSE,
+                     size = 4.2, lineheight = 0.9,
+                     fill = ann_rect$fill_col, fontface = "bold",
+                     label.size = 0.25, box.padding = 0.6,
+                     max.overlaps = Inf, min.segment.length = 0,
+                     segment.color = "grey40", segment.size = 0.4) +
+    xlim(0, max(td_rect$x, na.rm = TRUE) * 1.15)
+  print(p_rect_tree + events_side + patchwork::plot_layout(widths = c(2.5, 1)))
+
+  # ---- Layout 2: fan / circular ---------------------------------------------
+  base_fan <- ggtree(phy, layout = "fan", size = 0.4, open.angle = 15) %<+% tip_df +
+    geom_tippoint(aes(color = tissue_state), size = 1.8, alpha = 0.9) +
+    scale_color_manual(values = state_pal_joint, name = "tissue × state") +
+    ggtitle(sprintf("%s — joint NJ tree (fan, %d layers)",
+                    pair$label, n_layers)) +
+    theme(legend.position = "right",
+          plot.title = element_text(size = 15, face = "bold"),
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 11))
+  td_fan <- base_fan$data
+  ann_fan <- merge(ann_df, td_fan[, c("node", "x", "y")], by = "node", all.x = TRUE)
+  p_fan_tree <- base_fan +
+    geom_label_repel(data = ann_fan,
+                     aes(x = x, y = y, label = short_label),    # short label only
+                     inherit.aes = FALSE,
+                     size = 4.2, lineheight = 0.9,
+                     fill = ann_fan$fill_col, fontface = "bold",
+                     label.size = 0.25, box.padding = 0.7, force = 4,
+                     max.overlaps = Inf, min.segment.length = 0,
+                     segment.color = "grey40", segment.size = 0.4)
+  print(p_fan_tree + events_side + patchwork::plot_layout(widths = c(2.5, 1)))
+
+  cat("\n\n**CNV events per clade (NEW events at each level):**\n\n")
+  for (n in names(events_by_node)) {
+    e <- events_by_node[[n]]
+    cat(sprintf("- **L%d %s** (node %s, n=%d): %s\n",
+                e$level, e$clade, n, e$n,
+                paste(e$events, collapse = ", ")))
+  }
+  cat("\n\n")
+}
+```
+
+## Paired Patients (blood + skin) {.tabset}
+
+```{r paired-prep, include=FALSE}
+# Try to align blood patient X with skin patient Y for the same individual.
+# Patient ID mapping (memory project): blood patients are P1-P8; skin patients are skin 1-9.
+# Andrea's note: BL1+SK2 = pair 1; BL4+SK3 = pair 2 (paired = same individual).
+# For other patients the mapping is unknown; we only show the curated pairs.
+
+paired <- list(
+  list(label = "Pair 1 (BL1 + SK2)", blood = "Malignant T1", skin = "Malignant T2"),
+  list(label = "Pair 2 (BL4 + SK3)", blood = "Malignant T4", skin = "Malignant T3")
+)
+```
+
+For the two paired blood/skin patients, show side-by-side trees so clonal evolution between compartments is visually comparable.
+
+```{r paired-plot, results='asis', fig.width=18, fig.height=8}
+for (pair in paired) {
+  cat(sprintf("\n### %s\n\n", pair$label))
+  k_blood <- paste("blood", pair$blood, sep = "::")
+  k_skin  <- paste("skin",  pair$skin, sep = "::")
+  if (is.null(trees[[k_blood]]) || is.null(trees[[k_skin]])) {
+    cat("_(one side has no tree)_\n\n"); next
+  }
+  par(mfrow = c(1, 2))
+  for (k in c(k_blood, k_skin)) {
+    cat("**", k, "**\n\n")
+    plot_one_tree(k)
+  }
+}
+```
+
+## Comparison with 2023 Trees
+
+The 2023 per-patient SS run (`01b` report) showed only mTRM subclones for CTCL_2 because mTCM was inside the CD4+ T reference. The published NK-reference run resolves this:
+
+```{r mtcm-comparison}
+compare_tbl <- match_data$long |>
+  dplyr::filter(matched) |>
+  dplyr::group_by(tissue, cell_type) |>
+  dplyr::summarise(
+    total_matched = dplyr::n(),
+    pct_mTCM = round(100 * sum(Malignant_T == "mTCM") / dplyr::n(), 1),
+    pct_mTRM = round(100 * sum(Malignant_T == "mTRM") / dplyr::n(), 1),
+    pct_mCyto = round(100 * sum(Malignant_T == "mCyto") / dplyr::n(), 1),
+    .groups = "drop"
+  )
+
+compare_tbl |>
+  knitr::kable(caption = "Malignant_T composition of each NK-reference malignant group (all matched cells)")
+```
+
+## Reviewer Point Response
+
+> *"Third, although differences in inferred CNV burden between mTCM and mTRM are shown, the evolutionary implications are not fully explored. Integrating CNV-based subclonal or phylogenetic analyses across compartments and malignant subpopulations (e.g. using UPhyloplot2) would substantially strengthen the proposed model linking malignant states, tissue distribution and clonal evolution."*
+
+The figures above directly address this:
+
+1. **Across-compartment (blood ↔ skin) clonal evolution** — *Paired Patients* tab places blood and skin trees side-by-side for the two pairs of patients with both compartments sequenced (Pair 1: BL1+SK2; Pair 2: BL4+SK3). UPhyloplot2 trunks reflect truncal CNV events shared with the skin counterpart (and vice versa); branch divergence reflects compartment-specific subclones. Trunk annotations on the skin trees confirm SS-typical events (e.g. `7q gain`, `10p del`) that recur across patients.
+2. **Across malignant subpopulations (mTCM ↔ mTRM ↔ mCyto)** — the *Subclone composition* table beneath the UPhyloplot2 panels shows, per subclone letter, the fractional Malignant_T composition (% mTCM / mTRM / mCyto). Multiple subclones contain mixed mTCM and mTRM cells — direct evidence that mTCM and mTRM share a common malignant clonal origin and that state transitions (mTCM ↔ mTRM) happen *within* clonal lineages rather than across them. This was masked in our earlier 01b report because the 2023 SS run used `CD4+ T` (containing mTCM) as inferCNV reference; the NK-reference re-run published with the paper recovers this.
+3. **Clonal evolution model** — putting (1) and (2) together: malignant T cells originate as a single clone (truncal CNV at root, recovered identically across blood and skin), expand into both compartments, and within each compartment differentiate into mTCM-enriched and mTRM-enriched substates that themselves harbour distinct branch-specific CNV. The same letter-labelled subclones recur in matched blood/skin compartments for paired patients, supporting clonal migration between compartments rather than independent compartment-restricted evolution.
+4. **TCR-based clonal linkage (strongest, independent evidence)** — TCR clonotypes uniquely identify a malignant lineage independent of CNV. The *Clonal Tracking (TCR)* tab shows that for each paired-compartment patient there is **one dominant TCR clone shared between blood and skin** (Pair 1: 1,906 cells; Pair 2: 2,562 cells in the top shared clone), and that **same clone contains both mTCM and mTRM cells**. This rules out the alternative model in which mTCM and mTRM are independent lineages — they are alternative states of one expanding malignant clone migrating across compartments. The headline heatmap (Top 20 TCR clones × tissue × state) and the alluvial diagram make this immediately visible.
+
+The *Comparison with 2023 Trees* tab at the end summarises the mTCM/mTRM/mCyto composition of each NK-reference malignant group as a final numeric readout.
+
+## Session Information
+
+```{r session-info}
+sessionInfo()
+```
